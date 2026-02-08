@@ -36,9 +36,11 @@
  * - WEBHOOK_URL (for /setwebhook)
  * - ADMIN_BEARER_TOKEN (to access admin panel outside Telegram)
  * - AI_PROVIDER=openai|gemini|compat|cloudflare
- * - OPENAI_API_KEY, OPENAI_MODEL
- * - GEMINI_API_KEY, GEMINI_MODEL
- * - AI_COMPAT_BASE_URL, AI_COMPAT_API_KEY, AI_COMPAT_MODEL
+ * - AI_PROVIDER_FALLBACKS=openai,gemini,compat,cloudflare (optional)
+ * - OPENAI_API_KEY, OPENAI_MODEL (comma-separated models supported)
+ * - GEMINI_API_KEY, GEMINI_MODEL (comma-separated models supported)
+ * - AI_COMPAT_BASE_URL, AI_COMPAT_API_KEY, AI_COMPAT_MODEL (comma-separated models supported)
+ * - CF_AI_MODELS (comma-separated Cloudflare AI models; optional)
  * - BSCSCAN_API_KEY, USDT_BEP20_CONTRACT
  * - PAYMENT_WEBHOOK_SECRET (optional for /webhook/payment)
  * - Data provider keys: TWELVEDATA_API_KEY, FINNHUB_API_KEY, ALPHAVANTAGE_API_KEY, POLYGON_API_KEY
@@ -1655,117 +1657,149 @@ function extractLastJsonObject(text) {
   }
 }
 async function callAI(env, cfg, purpose, messages, timeoutMs = 15000) {
-  const provider = String(env.AI_PROVIDER || "cloudflare").toLowerCase();
+  const primary = String(env.AI_PROVIDER || "cloudflare").toLowerCase();
+  const fallbacks = splitKeys(env.AI_PROVIDER_FALLBACKS).map((x) => String(x).toLowerCase());
+  const providers = Array.from(new Set([primary, ...fallbacks].filter(Boolean)));
+  let lastError = "Unknown AI_PROVIDER";
 
-  // Circuit breaker per provider
-  const cbName = `ai:${provider}:${purpose}`;
-  if (await circuitIsOpen(env, cbName)) return { ok: false, error: "ai_circuit_open" };
+  for (const provider of providers) {
+    const cbName = `ai:${provider}:${purpose}`;
+    if (await circuitIsOpen(env, cbName)) {
+      lastError = "ai_circuit_open";
+      continue;
+    }
 
-  // Cloudflare AI binding
-  if (provider === "cloudflare") {
-    if (!env.AI || !env.AI.run) return { ok: false, error: "Cloudflare AI binding not available" };
-    try {
-      const model = "@cf/meta/llama-3.1-8b-instruct";
-      const prompt = messages.map((m) => `${m.role.toUpperCase()}: ${m.content}`).join("\n\n");
-      const p = env.AI.run(model, { prompt, max_tokens: 1400 });
-      const out = await promiseWithTimeout(p, timeoutMs, "ai_timeout");
-      const text = out?.response || out?.output_text || JSON.stringify(out);
-      await circuitReport(env, cbName, true);
-      return { ok: true, text: String(text || "") };
-    } catch (e) {
-      console.error("CF AI error", e);
+    if (provider === "cloudflare") {
+      if (!env.AI || !env.AI.run) {
+        lastError = "Cloudflare AI binding not available";
+        continue;
+      }
+      const models = splitKeys(env.CF_AI_MODELS || env.CF_AI_MODEL || "") || [];
+      const modelList = models.length ? models : ["@cf/meta/llama-3.1-8b-instruct"];
+      for (const model of modelList) {
+        try {
+          const prompt = messages.map((m) => `${m.role.toUpperCase()}: ${m.content}`).join("\n\n");
+          const p = env.AI.run(model, { prompt, max_tokens: 1400 });
+          const out = await promiseWithTimeout(p, timeoutMs, "ai_timeout");
+          const text = out?.response || out?.output_text || JSON.stringify(out);
+          if (text) {
+            await circuitReport(env, cbName, true);
+            return { ok: true, text: String(text || "") };
+          }
+        } catch (e) {
+          console.error("CF AI error", e);
+          lastError = String(e?.message || e);
+        }
+      }
       await circuitReport(env, cbName, false);
-      return { ok: false, error: String(e?.message || e) };
+      continue;
     }
-  }
 
-  // OpenAI
-  if (provider === "openai") {
-    const keys = splitKeys(env.OPENAI_API_KEY);
-    const model = String(env.OPENAI_MODEL || "gpt-4o-mini").trim();
-    if (!keys.length) return { ok: false, error: "OPENAI_API_KEY missing" };
-    for (const key of keys) {
-      try {
-        const res = await fetchWithTimeout(
-          "https://api.openai.com/v1/chat/completions",
-          {
-            method: "POST",
-            headers: { "content-type": "application/json", authorization: `Bearer ${key}` },
-            body: JSON.stringify({ model, messages, temperature: 0.3 })
-          },
-          timeoutMs
-        );
-        const j = await safeJson(res);
-        const text = j?.choices?.[0]?.message?.content || "";
-        if (text) {
-          await circuitReport(env, cbName, true);
-          return { ok: true, text: String(text || "") };
-        }
-      } catch (e) {
-        console.error("OpenAI error", e);
+    if (provider === "openai") {
+      const keys = splitKeys(env.OPENAI_API_KEY);
+      const models = splitKeys(env.OPENAI_MODEL || "gpt-4o-mini");
+      if (!keys.length) {
+        lastError = "OPENAI_API_KEY missing";
+        continue;
       }
-    }
-    await circuitReport(env, cbName, false);
-    return { ok: false, error: "openai_error" };
-  }
-
-  // Gemini
-  if (provider === "gemini") {
-    const keys = splitKeys(env.GEMINI_API_KEY);
-    const model = String(env.GEMINI_MODEL || "gemini-1.5-flash").trim();
-    if (!keys.length) return { ok: false, error: "GEMINI_API_KEY missing" };
-    const contents = messages.map((m) => ({ role: m.role === "assistant" ? "model" : "user", parts: [{ text: m.content }] }));
-    for (const key of keys) {
-      try {
-        const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(key)}`;
-        const res = await fetchWithTimeout(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ contents }) }, timeoutMs);
-        const j = await safeJson(res);
-        const text = j?.candidates?.[0]?.content?.parts?.map((p) => p.text).join("\n") || "";
-        if (text) {
-          await circuitReport(env, cbName, true);
-          return { ok: true, text: String(text || "") };
+      for (const model of models) {
+        for (const key of keys) {
+          try {
+            const res = await fetchWithTimeout(
+              "https://api.openai.com/v1/chat/completions",
+              {
+                method: "POST",
+                headers: { "content-type": "application/json", authorization: `Bearer ${key}` },
+                body: JSON.stringify({ model, messages, temperature: 0.3 })
+              },
+              timeoutMs
+            );
+            const j = await safeJson(res);
+            const text = j?.choices?.[0]?.message?.content || "";
+            if (text) {
+              await circuitReport(env, cbName, true);
+              return { ok: true, text: String(text || "") };
+            }
+          } catch (e) {
+            console.error("OpenAI error", e);
+            lastError = String(e?.message || e);
+          }
         }
-      } catch (e) {
-        console.error("Gemini error", e);
       }
+      await circuitReport(env, cbName, false);
+      continue;
     }
-    await circuitReport(env, cbName, false);
-    return { ok: false, error: "gemini_error" };
-  }
 
-  // Compat (OpenAI-compatible)
-  if (provider === "compat") {
-    const base = String(env.AI_COMPAT_BASE_URL || "").trim();
-    const keys = splitKeys(env.AI_COMPAT_API_KEY);
-    const model = String(env.AI_COMPAT_MODEL || "").trim();
-    if (!base || !keys.length || !model) return { ok: false, error: "AI_COMPAT_* missing" };
-    const url = base.replace(/\/+$/, "") + "/chat/completions";
-    for (const key of keys) {
-      try {
-        const res = await fetchWithTimeout(
-          url,
-          {
-            method: "POST",
-            headers: { "content-type": "application/json", authorization: `Bearer ${key}` },
-            body: JSON.stringify({ model, messages, temperature: 0.3 })
-          },
-          timeoutMs
-        );
-        const j = await safeJson(res);
-        const text = j?.choices?.[0]?.message?.content || "";
-        if (text) {
-          await circuitReport(env, cbName, true);
-          return { ok: true, text: String(text || "") };
+    if (provider === "gemini") {
+      const keys = splitKeys(env.GEMINI_API_KEY);
+      const models = splitKeys(env.GEMINI_MODEL || "gemini-1.5-flash");
+      if (!keys.length) {
+        lastError = "GEMINI_API_KEY missing";
+        continue;
+      }
+      const contents = messages.map((m) => ({ role: m.role === "assistant" ? "model" : "user", parts: [{ text: m.content }] }));
+      for (const model of models) {
+        for (const key of keys) {
+          try {
+            const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(key)}`;
+            const res = await fetchWithTimeout(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ contents }) }, timeoutMs);
+            const j = await safeJson(res);
+            const text = j?.candidates?.[0]?.content?.parts?.map((p) => p.text).join("\n") || "";
+            if (text) {
+              await circuitReport(env, cbName, true);
+              return { ok: true, text: String(text || "") };
+            }
+          } catch (e) {
+            console.error("Gemini error", e);
+            lastError = String(e?.message || e);
+          }
         }
-      } catch (e) {
-        console.error("Compat error", e);
       }
+      await circuitReport(env, cbName, false);
+      continue;
     }
-    await circuitReport(env, cbName, false);
-    return { ok: false, error: "compat_error" };
+
+    if (provider === "compat") {
+      const base = String(env.AI_COMPAT_BASE_URL || "").trim();
+      const keys = splitKeys(env.AI_COMPAT_API_KEY);
+      const models = splitKeys(env.AI_COMPAT_MODEL || "");
+      if (!base || !keys.length || !models.length) {
+        lastError = "AI_COMPAT_* missing";
+        continue;
+      }
+      const url = base.replace(/\/+$/, "") + "/chat/completions";
+      for (const model of models) {
+        for (const key of keys) {
+          try {
+            const res = await fetchWithTimeout(
+              url,
+              {
+                method: "POST",
+                headers: { "content-type": "application/json", authorization: `Bearer ${key}` },
+                body: JSON.stringify({ model, messages, temperature: 0.3 })
+              },
+              timeoutMs
+            );
+            const j = await safeJson(res);
+            const text = j?.choices?.[0]?.message?.content || "";
+            if (text) {
+              await circuitReport(env, cbName, true);
+              return { ok: true, text: String(text || "") };
+            }
+          } catch (e) {
+            console.error("Compat error", e);
+            lastError = String(e?.message || e);
+          }
+        }
+      }
+      await circuitReport(env, cbName, false);
+      continue;
+    }
+
+    lastError = "Unknown AI_PROVIDER";
   }
 
-  return { ok: false, error: "Unknown AI_PROVIDER" };
+  return { ok: false, error: lastError };
 }
 
 // ========== Zones schema ==========
