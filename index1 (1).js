@@ -21,6 +21,8 @@
  * Bindings expected:
  * - env.BOT_KV (KV namespace binding)
  * - env.AI (optional Cloudflare AI binding)
+ * - env.m_db (optional D1 binding for cache/logs)
+ * - env.BOT_R2 (optional R2 binding for banner assets)
  *
  * Required ENV:
  * - BOT_TOKEN
@@ -37,6 +39,8 @@
  * - OPENAI_API_KEY, OPENAI_MODEL
  * - GEMINI_API_KEY, GEMINI_MODEL
  * - AI_COMPAT_BASE_URL, AI_COMPAT_API_KEY, AI_COMPAT_MODEL
+ * - BSCSCAN_API_KEY, USDT_BEP20_CONTRACT
+ * - PAYMENT_WEBHOOK_SECRET (optional for /webhook/payment)
  * - Data provider keys: TWELVEDATA_API_KEY, FINNHUB_API_KEY, ALPHAVANTAGE_API_KEY, POLYGON_API_KEY
  * - Limits/points defaults: FREE_DAILY_LIMIT, FREE_MONTHLY_LIMIT, SUB_DAILY_LIMIT, SUB_PRICE_USDT, SUB_DURATION_DAYS
  * - REF_POINTS_PER_INVITE, REF_POINTS_REDEEM_FREE_SUB, REF_POINTS_BUY_SUB, REF_COMMISSION_STEP_PCT, REF_COMMISSION_MAX_PCT
@@ -57,6 +61,11 @@ const clamp = (n, a, b) => Math.max(a, Math.min(b, n));
 const pad2 = (n) => String(n).padStart(2, "0");
 const utcDateKey = (d = new Date()) => `${d.getUTCFullYear()}-${pad2(d.getUTCMonth() + 1)}-${pad2(d.getUTCDate())}`;
 const utcMonthKey = (d = new Date()) => `${d.getUTCFullYear()}-${pad2(d.getUTCMonth() + 1)}`;
+const splitKeys = (v) =>
+  String(v || "")
+    .split(/[,\s]+/g)
+    .map((s) => s.trim())
+    .filter(Boolean);
 const safeParseInt = (v, def = 0) => {
   const n = Number.parseInt(String(v ?? ""), 10);
   return Number.isFinite(n) ? n : def;
@@ -120,6 +129,10 @@ function normalizeSymbolInput(t) {
   if (clean.length < 2 || clean.length > 24) return "";
   return clean;
 }
+function isValidEvmAddress(addr) {
+  const a = String(addr || "").trim();
+  return /^0x[a-fA-F0-9]{40}$/.test(a);
+}
 function ensureBackHint(msg) {
   return `${msg}\n\n⬅️ برای برگشت: /menu`;
 }
@@ -180,6 +193,7 @@ const kCircuit = (name) => `${KV_PREFIX}cb:${name}`;
 const kMetricDay = (dayKey) => `${KV_PREFIX}m:day:${dayKey}`;
 const kActiveDayUser = (dayKey, userId) => `${KV_PREFIX}active:${dayKey}:${userId}`;
 const kBroadcastJob = (jobId) => `${KV_PREFIX}job:broadcast:${jobId}`;
+const kAnalysisCache = (hash) => `${KV_PREFIX}acache:${hash}`;
 
 // ========== KV helpers ==========
 async function kvGetJson(env, key) {
@@ -226,6 +240,20 @@ async function kvList(env, prefix, limit = 100, cursor = undefined) {
   }
 }
 
+// ========== D1 helper (optional) ==========
+const D1_CACHE = { ready: false };
+async function ensureD1(env) {
+  if (!env.m_db || D1_CACHE.ready) return;
+  try {
+    await env.m_db.exec(
+      "CREATE TABLE IF NOT EXISTS analysis_cache (cache_key TEXT PRIMARY KEY, payload TEXT, created_at INTEGER, ttl_ms INTEGER)"
+    );
+    D1_CACHE.ready = true;
+  } catch (e) {
+    console.error("D1 init error", e);
+  }
+}
+
 // ========== RBAC ==========
 function isOwnerId(env, userId) {
   const id = String(userId);
@@ -244,8 +272,8 @@ function roleOf(env, userId) {
 
 // ========== Defaults / Config ==========
 function defaultConfig(env) {
-  const freeDaily = safeParseInt(env.FREE_DAILY_LIMIT, 50);
-  const freeMonthly = safeParseInt(env.FREE_MONTHLY_LIMIT, 500);
+  const freeDaily = safeParseInt(env.FREE_DAILY_LIMIT, 3);
+  const freeMonthly = safeParseInt(env.FREE_MONTHLY_LIMIT, 100);
   const subDaily = safeParseInt(env.SUB_DAILY_LIMIT, 50);
 
   const subPrice = safeParseFloat(env.SUB_PRICE_USDT, 2);
@@ -284,28 +312,29 @@ function defaultConfig(env) {
     banner: {
       enabled: true,
       text: "🎁 پیشنهاد ویژه: با اشتراک Market IQ حرفه‌ای شو!",
-      link: "https://t.me/"
+      link: "https://t.me/",
+      imageKey: ""
     },
     styles: {
       RTM: { enabled: true, label: "RTM" },
       ICT: { enabled: true, label: "ICT" },
-      PRICE_ACTION: { enabled: true, label: "Price Action" },
-      GENERAL: { enabled: true, label: "General Prompt" },
-      METHOD: { enabled: true, label: "Method" },
-      CUSTOM: { enabled: true, label: "Custom Prompt" }
+      PRICE_ACTION: { enabled: true, label: "پرایس اکشن" },
+      GENERAL: { enabled: true, label: "تحلیل عمومی" },
+      METHOD: { enabled: true, label: "متد" },
+      CUSTOM: { enabled: true, label: "پرامپت اختصاصی" }
     },
     prompts: {
       base:
-        "You are Market IQ, a professional market analyst. Provide structured analysis in Persian. Include bias, structure, key levels, zones, scenarios, invalidation, risk management, and an actionable plan.",
+        "تو Market IQ هستی؛ تحلیل‌گر حرفه‌ای بازار. خروجی را همیشه فارسی و ساختاریافته ارائه کن. داده‌های زیر را حتما در تحلیل لحاظ کن و به آن‌ها ارجاع بده: تایم‌فریم، نماد، بازار، داده لحظه‌ای بازار، سطح کاربر، سبک انتخابی و پرامپت سبک.",
       vision:
         "You are Market IQ Vision. Analyze the given chart image and return concise observations and zone confirmations in Persian.",
       perStyle: {
-        RTM: "Use RTM logic: origin/base/impulse, fresh zones, clear invalidation, and risk plan.",
-        ICT: "Use ICT concepts: liquidity, order blocks, FVG, session bias, and clear invalidation.",
-        PRICE_ACTION: "Use pure price action: market structure, S/R, momentum, and clear invalidation.",
-        GENERAL: "General multi-factor technical analysis with clear invalidation.",
-        METHOD: "Follow method: data -> bias -> setup -> risk -> plan. Keep it practical.",
-        CUSTOM: "Use the user's custom strategy prompt if available; otherwise use GENERAL."
+        RTM: "با منطق RTM تحلیل کن: origin/base/impulse، زون‌های تازه، ابطال واضح و پلن ریسک.",
+        ICT: "با مفاهیم ICT: نقدینگی، order block، FVG، سشن‌ها و ابطال واضح.",
+        PRICE_ACTION: "پرایس اکشن خالص: ساختار بازار، حمایت/مقاومت، مومنتوم و ابطال.",
+        GENERAL: "تحلیل تکنیکال عمومی چندفاکتوره با ابطال واضح.",
+        METHOD: "روش: داده -> بایاس -> ستاپ -> ریسک -> پلن. عملی و کوتاه.",
+        CUSTOM: "از استراتژی اختصاصی کاربر استفاده کن؛ اگر نبود General."
       }
     },
     news: {
@@ -342,6 +371,9 @@ function defaultConfig(env) {
       visionEnabled: false, // optional
       broadcastEnabled: true
     },
+    cache: {
+      analysisTtlMs: 3 * 60 * 1000
+    },
     security: {
       // basic rate limits (best-effort; KV not atomic)
       rlWebhookPerMin: 60, // per user
@@ -373,6 +405,7 @@ function normalizeConfig(env, cfg) {
       forexCalendar: { ...d.news.forexCalendar, ...(cfg?.news?.forexCalendar || {}) }
     },
     features: { ...d.features, ...(cfg?.features || {}) },
+    cache: { ...d.cache, ...(cfg?.cache || {}) },
     security: { ...d.security, ...(cfg?.security || {}) }
   };
 
@@ -396,6 +429,7 @@ function normalizeConfig(env, cfg) {
   out.features.newsEnabled = !!out.features.newsEnabled;
   out.features.visionEnabled = !!out.features.visionEnabled;
   out.features.broadcastEnabled = !!out.features.broadcastEnabled;
+  out.cache.analysisTtlMs = clamp(safeParseInt(out.cache.analysisTtlMs, d.cache.analysisTtlMs), 30 * 1000, 30 * 60 * 1000);
 
   out.security.rlWebhookPerMin = clamp(safeParseInt(out.security.rlWebhookPerMin, d.security.rlWebhookPerMin), 10, 600);
   out.security.rlAnalyzePerMin = clamp(safeParseInt(out.security.rlAnalyzePerMin, d.security.rlAnalyzePerMin), 1, 120);
@@ -419,6 +453,48 @@ async function loadConfig(env) {
   CONFIG_CACHE.cfg = cfg;
   CONFIG_CACHE.ts = nowMs();
   return cfg;
+}
+
+// ========== Analysis cache ==========
+async function getAnalysisCache(env, cacheKey, ttlMs) {
+  const kvKey = kAnalysisCache(cacheKey);
+  const cached = await kvGetJson(env, kvKey);
+  if (cached?.ts && nowMs() - cached.ts < ttlMs) return cached;
+
+  if (env.m_db) {
+    await ensureD1(env);
+    try {
+      const res = await env.m_db.prepare("SELECT payload, created_at, ttl_ms FROM analysis_cache WHERE cache_key = ?").bind(cacheKey).first();
+      if (res?.payload && res.created_at && res.ttl_ms) {
+        if (nowMs() - res.created_at < res.ttl_ms) {
+          try {
+            return { ts: res.created_at, payload: JSON.parse(res.payload) };
+          } catch {
+            return null;
+          }
+        }
+      }
+    } catch (e) {
+      console.error("D1 cache read error", e);
+    }
+  }
+  return null;
+}
+async function setAnalysisCache(env, cacheKey, payload, ttlMs) {
+  const kvKey = kAnalysisCache(cacheKey);
+  await kvPutJson(env, kvKey, { ts: nowMs(), payload }, { expirationTtl: Math.ceil(ttlMs / 1000) });
+
+  if (env.m_db) {
+    await ensureD1(env);
+    try {
+      await env.m_db
+        .prepare("INSERT OR REPLACE INTO analysis_cache (cache_key, payload, created_at, ttl_ms) VALUES (?, ?, ?, ?)")
+        .bind(cacheKey, JSON.stringify(payload), nowMs(), ttlMs)
+        .run();
+    } catch (e) {
+      console.error("D1 cache write error", e);
+    }
+  }
 }
 
 async function auditLog(env, actorId, action, beforeObj, afterObj, meta = {}) {
@@ -462,21 +538,13 @@ function applyConfigPatchWithRBAC(env, role, cfg, patch) {
   const cur = normalizeConfig(env, cfg || {});
   const next = JSON.parse(JSON.stringify(cur));
 
-  const isOwner = role === "owner";
+  const isOwner = role === "owner" || role === "admin";
   const isAdmin = role === "admin" || role === "owner";
 
   if (!patch || typeof patch !== "object") return next;
 
-  // Admin allowed: limits, banner, subscription price/duration/dailyLimit (operational), feature flags (some), security (limited)
-  // Owner-only: walletPublic, points rules, commission rules, prompts, styles, rss sources/noiseFilters, security advanced
-  const ownerOnly = new Set([
-    "walletPublic",
-    "points",
-    "commission",
-    "prompts",
-    "styles",
-    "news"
-  ]);
+  // Admins can manage operational + prompt/style/news; owners share same access (admin is superset).
+  const ownerOnly = new Set([]);
 
   for (const key of Object.keys(patch)) {
     if (ownerOnly.has(key) && !isOwner) continue;
@@ -484,7 +552,8 @@ function applyConfigPatchWithRBAC(env, role, cfg, patch) {
     if (key === "limits" && !isAdmin) continue;
     if (key === "banner" && !isAdmin) continue;
     if (key === "features" && !isAdmin) continue;
-    if (key === "security" && !isOwner) continue; // security owner-only
+    if (key === "security" && !isOwner) continue;
+    if (key === "cache" && !isAdmin) continue;
 
     // Apply
     if (key === "walletPublic") next.walletPublic = String(patch.walletPublic || "").trim();
@@ -492,6 +561,7 @@ function applyConfigPatchWithRBAC(env, role, cfg, patch) {
     else if (key === "limits") next.limits = { ...next.limits, ...(patch.limits || {}) };
     else if (key === "banner") next.banner = { ...next.banner, ...(patch.banner || {}) };
     else if (key === "features") next.features = { ...next.features, ...(patch.features || {}) };
+    else if (key === "cache") next.cache = { ...next.cache, ...(patch.cache || {}) };
     else if (key === "security") next.security = { ...next.security, ...(patch.security || {}) };
     else if (key === "points") next.points = { ...next.points, ...(patch.points || {}) };
     else if (key === "commission") next.commission = { ...next.commission, ...(patch.commission || {}) };
@@ -511,7 +581,7 @@ function applyConfigPatchWithRBAC(env, role, cfg, patch) {
 
 async function rollbackConfig(env, actorId, verKey) {
   const role = roleOf(env, actorId);
-  if (role !== "owner") return { ok: false, error: "owner_only" };
+  if (!(role === "owner" || role === "admin")) return { ok: false, error: "owner_only" };
 
   const snap = await kvGetJson(env, verKey);
   if (!snap) return { ok: false, error: "version_not_found" };
@@ -538,7 +608,8 @@ function defaultUser(id) {
       name: "",
       phone: "",
       experience: "",
-      favoriteMarket: ""
+      favoriteMarket: "",
+      level: ""
     },
     settings: {
       tf: "H1",
@@ -610,7 +681,8 @@ async function ensureUser(env, userId) {
 
   // Fix missing structures
   if (!u.moderation) u.moderation = { bannedUntil: 0, banReason: "", phoneDuplicate: false };
-  if (!u.profile) u.profile = { onboardingDone: false, name: "", phone: "", experience: "", favoriteMarket: "" };
+  if (!u.profile) u.profile = { onboardingDone: false, name: "", phone: "", experience: "", favoriteMarket: "", level: "" };
+  if (u.profile && typeof u.profile.level !== "string") u.profile.level = String(u.profile.level || "");
   if (!u.settings) u.settings = { tf: "H1", risk: "متوسط", style: "GENERAL", news: true };
   if (!u.quota) u.quota = { dayKey: utcDateKey(), dayUsed: 0, monthKey: utcMonthKey(), monthUsed: 0 };
   if (!u.referral) u.referral = { code: randomToken(8), referredBy: "", invites: 0, successfulInvites: 0, points: 0, commissionPct: 0 };
@@ -819,7 +891,7 @@ function mainMenuKeyboard() {
       [{ text: "👤 پروفایل" }, { text: "💳 خرید اشتراک" }],
       [{ text: "🎁 رفرال" }, { text: "🧠 تعیین سطح" }],
       [{ text: "🆘 پشتیبانی" }, { text: "📚 آموزش" }],
-      [{ text: "🧩 Mini App" }]
+      [{ text: "🧩 مینی‌اپ" }]
     ],
     resize_keyboard: true,
     is_persistent: true
@@ -871,7 +943,7 @@ function settingsKeyboard(cfg, user) {
     keyboard: [
       [{ text: `⏱ تایم‌فریم: ${tf}` }, { text: `⚠️ ریسک: ${risk}` }],
       [{ text: `🧠 سبک: ${styleLabel(cfg, style)}` }],
-      [{ text: `📰 News: ${news}` }],
+      [{ text: `📰 اخبار: ${news}` }],
       [{ text: "🧩 انتخاب سبک (لیست)" }],
       [{ text: "⬅️ منو" }]
     ],
@@ -896,6 +968,11 @@ function levelResultInline() {
     ]
   };
 }
+function supportFaqInline() {
+  const rows = SUPPORT_FAQ.map((f) => [{ text: f.q, callback_data: `support:faq:${f.id}` }]);
+  rows.push([{ text: "✍️ ارسال تیکت جدید", callback_data: "support:new" }]);
+  return { inline_keyboard: rows };
+}
 
 // Mapping ReplyKeyboard button text -> command
 function mapButtonToCommand(text) {
@@ -909,7 +986,7 @@ function mapButtonToCommand(text) {
     "🧠 تعیین سطح": "/level",
     "🆘 پشتیبانی": "/support",
     "📚 آموزش": "/education",
-    "🧩 Mini App": "/miniapp",
+    "🧩 مینی‌اپ": "/miniapp",
     "⬅️ منو": "/menu"
   };
   return m[t] || "";
@@ -1005,10 +1082,42 @@ function validTxid(txid) {
   const t = String(txid || "").trim();
   return /^[a-fA-F0-9]{12,120}$/.test(t);
 }
+function normalizeEvmAddress(addr) {
+  return String(addr || "").trim().toLowerCase();
+}
 async function publicWallet(env, cfg) {
   const w = String(cfg.walletPublic || "").trim();
   if (w) return w;
   return String(env.BOT_PUBLIC_WALLET || "").trim();
+}
+async function verifyBep20Payment(env, cfg, txid) {
+  const wallet = await publicWallet(env, cfg);
+  if (!isValidEvmAddress(wallet)) return { ok: false, error: "wallet_invalid" };
+
+  const keys = splitKeys(env.BSCSCAN_API_KEY);
+  if (!keys.length) return { ok: false, error: "no_bscscan_key" };
+
+  const contract = normalizeEvmAddress(env.USDT_BEP20_CONTRACT || "0x55d398326f99059ff775485246999027b3197955");
+  for (const key of keys) {
+    const url =
+      "https://api.bscscan.com/api?module=account&action=tokentx" +
+      `&txhash=${encodeURIComponent(txid)}` +
+      `&apikey=${encodeURIComponent(key)}`;
+    const res = await fetchWithTimeout(url, { method: "GET" }, 8000);
+    if (!res.ok) continue;
+    const j = await safeJson(res);
+    const list = Array.isArray(j?.result) ? j.result : [];
+    if (!list.length) continue;
+    const hit = list.find((r) => normalizeEvmAddress(r?.contractAddress) === contract);
+    if (!hit) continue;
+    const to = normalizeEvmAddress(hit?.to);
+    const decimals = safeParseInt(hit?.tokenDecimal, 18);
+    const amountRaw = Number(hit?.value || 0);
+    const amount = Number.isFinite(amountRaw) ? amountRaw / Math.pow(10, decimals) : 0;
+    const ok = to === normalizeEvmAddress(wallet);
+    return { ok: true, match: ok, amount, to, contract };
+  }
+  return { ok: false, error: "bscscan_unavailable" };
 }
 async function registerTx(env, cfg, userId, txid) {
   const t = String(txid || "").trim();
@@ -1029,8 +1138,30 @@ async function registerTx(env, cfg, userId, txid) {
     priceUSDT: cfg.subscription.priceUSDT,
     durationDays: cfg.subscription.durationDays,
     subDailyLimit: cfg.subscription.dailyLimit,
-    note: ""
+    note: "",
+    verify: {
+      checked: false,
+      ok: false,
+      match: false,
+      amount: 0,
+      wallet: "",
+      error: ""
+    }
   };
+
+  try {
+    const verify = await verifyBep20Payment(env, cfg, t);
+    record.verify.checked = true;
+    record.verify.ok = !!verify.ok;
+    record.verify.match = !!verify.match;
+    record.verify.amount = Number(verify.amount || 0);
+    record.verify.wallet = await publicWallet(env, cfg);
+    record.verify.error = verify.ok ? "" : String(verify.error || "verify_failed");
+  } catch (e) {
+    record.verify.checked = true;
+    record.verify.ok = false;
+    record.verify.error = String(e?.message || e);
+  }
 
   await kvPutJson(env, kPayment(t), record);
   await kvPutText(env, kPayIdx("pending", createdAt, t), "1", { expirationTtl: 60 * 24 * 3600 });
@@ -1126,6 +1257,34 @@ async function expireOldPendingPayments(env, cfg) {
       await metricInc(env, "paymentsExpired", 1);
     }
   }
+}
+
+async function handlePaymentWebhook(request, env, cfg) {
+  const secret = String(env.PAYMENT_WEBHOOK_SECRET || "").trim();
+  if (secret) {
+    const got = request.headers.get("x-payment-secret") || "";
+    if (got !== secret) return jsonResponse({ ok: false, error: "forbidden" }, 403);
+  }
+  const body = await request.json().catch(() => ({}));
+  const txid = String(body.txid || "").trim();
+  if (!validTxid(txid)) return jsonResponse({ ok: false, error: "invalid_txid" }, 400);
+
+  const p = await kvGetJson(env, kPayment(txid));
+  if (!p) return jsonResponse({ ok: false, error: "payment_not_found" }, 404);
+
+  p.verify = p.verify || {};
+  p.verify.checked = true;
+  p.verify.ok = !!body.verified;
+  p.verify.match = !!body.verified;
+  p.verify.amount = Number(body.amount || p.verify.amount || 0);
+  p.verify.wallet = String(body.to || p.verify.wallet || "");
+  p.verify.error = String(body.error || "");
+  p.updatedAt = nowMs();
+
+  await kvPutJson(env, kPayment(txid), p);
+  await notifyStaff(env, `🔔 وبهوک پرداخت دریافت شد\nTXID: ${txid}\nVerified: ${p.verify.ok}\nAmount: ${p.verify.amount || "-"}\nWallet: ${p.verify.wallet || "-"}`);
+
+  return jsonResponse({ ok: true });
 }
 
 // ========== Tickets ==========
@@ -1522,76 +1681,88 @@ async function callAI(env, cfg, purpose, messages, timeoutMs = 15000) {
 
   // OpenAI
   if (provider === "openai") {
-    const key = String(env.OPENAI_API_KEY || "").trim();
+    const keys = splitKeys(env.OPENAI_API_KEY);
     const model = String(env.OPENAI_MODEL || "gpt-4o-mini").trim();
-    if (!key) return { ok: false, error: "OPENAI_API_KEY missing" };
-    try {
-      const res = await fetchWithTimeout(
-        "https://api.openai.com/v1/chat/completions",
-        {
-          method: "POST",
-          headers: { "content-type": "application/json", authorization: `Bearer ${key}` },
-          body: JSON.stringify({ model, messages, temperature: 0.3 })
-        },
-        timeoutMs
-      );
-      const j = await safeJson(res);
-      const text = j?.choices?.[0]?.message?.content || "";
-      await circuitReport(env, cbName, true);
-      return { ok: true, text: String(text || "") };
-    } catch (e) {
-      console.error("OpenAI error", e);
-      await circuitReport(env, cbName, false);
-      return { ok: false, error: String(e?.message || e) };
+    if (!keys.length) return { ok: false, error: "OPENAI_API_KEY missing" };
+    for (const key of keys) {
+      try {
+        const res = await fetchWithTimeout(
+          "https://api.openai.com/v1/chat/completions",
+          {
+            method: "POST",
+            headers: { "content-type": "application/json", authorization: `Bearer ${key}` },
+            body: JSON.stringify({ model, messages, temperature: 0.3 })
+          },
+          timeoutMs
+        );
+        const j = await safeJson(res);
+        const text = j?.choices?.[0]?.message?.content || "";
+        if (text) {
+          await circuitReport(env, cbName, true);
+          return { ok: true, text: String(text || "") };
+        }
+      } catch (e) {
+        console.error("OpenAI error", e);
+      }
     }
+    await circuitReport(env, cbName, false);
+    return { ok: false, error: "openai_error" };
   }
 
   // Gemini
   if (provider === "gemini") {
-    const key = String(env.GEMINI_API_KEY || "").trim();
+    const keys = splitKeys(env.GEMINI_API_KEY);
     const model = String(env.GEMINI_MODEL || "gemini-1.5-flash").trim();
-    if (!key) return { ok: false, error: "GEMINI_API_KEY missing" };
-    try {
-      const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(key)}`;
-      const contents = messages.map((m) => ({ role: m.role === "assistant" ? "model" : "user", parts: [{ text: m.content }] }));
-      const res = await fetchWithTimeout(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ contents }) }, timeoutMs);
-      const j = await safeJson(res);
-      const text = j?.candidates?.[0]?.content?.parts?.map((p) => p.text).join("\n") || "";
-      await circuitReport(env, cbName, true);
-      return { ok: true, text: String(text || "") };
-    } catch (e) {
-      console.error("Gemini error", e);
-      await circuitReport(env, cbName, false);
-      return { ok: false, error: String(e?.message || e) };
+    if (!keys.length) return { ok: false, error: "GEMINI_API_KEY missing" };
+    const contents = messages.map((m) => ({ role: m.role === "assistant" ? "model" : "user", parts: [{ text: m.content }] }));
+    for (const key of keys) {
+      try {
+        const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(key)}`;
+        const res = await fetchWithTimeout(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ contents }) }, timeoutMs);
+        const j = await safeJson(res);
+        const text = j?.candidates?.[0]?.content?.parts?.map((p) => p.text).join("\n") || "";
+        if (text) {
+          await circuitReport(env, cbName, true);
+          return { ok: true, text: String(text || "") };
+        }
+      } catch (e) {
+        console.error("Gemini error", e);
+      }
     }
+    await circuitReport(env, cbName, false);
+    return { ok: false, error: "gemini_error" };
   }
 
   // Compat (OpenAI-compatible)
   if (provider === "compat") {
     const base = String(env.AI_COMPAT_BASE_URL || "").trim();
-    const key = String(env.AI_COMPAT_API_KEY || "").trim();
+    const keys = splitKeys(env.AI_COMPAT_API_KEY);
     const model = String(env.AI_COMPAT_MODEL || "").trim();
-    if (!base || !key || !model) return { ok: false, error: "AI_COMPAT_* missing" };
-    try {
-      const url = base.replace(/\/+$/, "") + "/chat/completions";
-      const res = await fetchWithTimeout(
-        url,
-        {
-          method: "POST",
-          headers: { "content-type": "application/json", authorization: `Bearer ${key}` },
-          body: JSON.stringify({ model, messages, temperature: 0.3 })
-        },
-        timeoutMs
-      );
-      const j = await safeJson(res);
-      const text = j?.choices?.[0]?.message?.content || "";
-      await circuitReport(env, cbName, true);
-      return { ok: true, text: String(text || "") };
-    } catch (e) {
-      console.error("Compat error", e);
-      await circuitReport(env, cbName, false);
-      return { ok: false, error: String(e?.message || e) };
+    if (!base || !keys.length || !model) return { ok: false, error: "AI_COMPAT_* missing" };
+    const url = base.replace(/\/+$/, "") + "/chat/completions";
+    for (const key of keys) {
+      try {
+        const res = await fetchWithTimeout(
+          url,
+          {
+            method: "POST",
+            headers: { "content-type": "application/json", authorization: `Bearer ${key}` },
+            body: JSON.stringify({ model, messages, temperature: 0.3 })
+          },
+          timeoutMs
+        );
+        const j = await safeJson(res);
+        const text = j?.choices?.[0]?.message?.content || "";
+        if (text) {
+          await circuitReport(env, cbName, true);
+          return { ok: true, text: String(text || "") };
+        }
+      } catch (e) {
+        console.error("Compat error", e);
+      }
     }
+    await circuitReport(env, cbName, false);
+    return { ok: false, error: "compat_error" };
   }
 
   return { ok: false, error: "Unknown AI_PROVIDER" };
@@ -1700,75 +1871,83 @@ async function fetchCandlesYahoo(symbol, range = "10d", interval = "1h") {
   return out;
 }
 async function fetchCandlesTwelveData(env, symbol, interval, outputsize) {
-  const key = String(env.TWELVEDATA_API_KEY || "").trim();
-  if (!key) throw new Error("no_twelvedata_key");
-  const url = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(interval)}&outputsize=${outputsize}&apikey=${encodeURIComponent(key)}`;
-  const res = await fetchWithTimeout(url, { method: "GET" }, 8000);
-  if (!res.ok) throw new Error("twelvedata_bad");
-  const j = await safeJson(res);
-  const values = j?.values;
-  if (!Array.isArray(values)) throw new Error("twelvedata_parse");
-  const out = values
-    .map((v) => {
-      const t = Date.parse(v.datetime || v.datetime_utc || "");
-      return { t, o: Number(v.open), h: Number(v.high), l: Number(v.low), c: Number(v.close) };
-    })
-    .filter((x) => [x.t, x.o, x.h, x.l, x.c].every(Number.isFinite));
-  out.reverse();
-  if (!out.length) throw new Error("twelvedata_empty");
-  return out;
+  const keys = splitKeys(env.TWELVEDATA_API_KEY);
+  if (!keys.length) throw new Error("no_twelvedata_key");
+  for (const key of keys) {
+    const url = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(interval)}&outputsize=${outputsize}&apikey=${encodeURIComponent(key)}`;
+    const res = await fetchWithTimeout(url, { method: "GET" }, 8000);
+    if (!res.ok) continue;
+    const j = await safeJson(res);
+    const values = j?.values;
+    if (!Array.isArray(values)) continue;
+    const out = values
+      .map((v) => {
+        const t = Date.parse(v.datetime || v.datetime_utc || "");
+        return { t, o: Number(v.open), h: Number(v.high), l: Number(v.low), c: Number(v.close) };
+      })
+      .filter((x) => [x.t, x.o, x.h, x.l, x.c].every(Number.isFinite));
+    out.reverse();
+    if (out.length) return out;
+  }
+  throw new Error("twelvedata_empty");
 }
 async function fetchCandlesFinnhub(env, symbol, resolution, fromSec, toSec) {
-  const key = String(env.FINNHUB_API_KEY || "").trim();
-  if (!key) throw new Error("no_finnhub_key");
-  const url = `https://finnhub.io/api/v1/stock/candle?symbol=${encodeURIComponent(symbol)}&resolution=${encodeURIComponent(resolution)}&from=${fromSec}&to=${toSec}&token=${encodeURIComponent(key)}`;
-  const res = await fetchWithTimeout(url, { method: "GET" }, 8000);
-  if (!res.ok) throw new Error("finnhub_bad");
-  const j = await safeJson(res);
-  if (j?.s !== "ok") throw new Error("finnhub_notok");
-  const out = [];
-  for (let i = 0; i < (j.t || []).length; i++) {
-    const t = Number(j.t[i]) * 1000;
-    const o = Number(j.o[i]), h = Number(j.h[i]), l = Number(j.l[i]), c = Number(j.c[i]);
-    if ([t, o, h, l, c].every(Number.isFinite)) out.push({ t, o, h, l, c });
+  const keys = splitKeys(env.FINNHUB_API_KEY);
+  if (!keys.length) throw new Error("no_finnhub_key");
+  for (const key of keys) {
+    const url = `https://finnhub.io/api/v1/stock/candle?symbol=${encodeURIComponent(symbol)}&resolution=${encodeURIComponent(resolution)}&from=${fromSec}&to=${toSec}&token=${encodeURIComponent(key)}`;
+    const res = await fetchWithTimeout(url, { method: "GET" }, 8000);
+    if (!res.ok) continue;
+    const j = await safeJson(res);
+    if (j?.s !== "ok") continue;
+    const out = [];
+    for (let i = 0; i < (j.t || []).length; i++) {
+      const t = Number(j.t[i]) * 1000;
+      const o = Number(j.o[i]), h = Number(j.h[i]), l = Number(j.l[i]), c = Number(j.c[i]);
+      if ([t, o, h, l, c].every(Number.isFinite)) out.push({ t, o, h, l, c });
+    }
+    if (out.length) return out;
   }
-  if (!out.length) throw new Error("finnhub_empty");
-  return out;
+  throw new Error("finnhub_empty");
 }
 async function fetchCandlesAlphaVantage(env, symbol, interval) {
-  const key = String(env.ALPHAVANTAGE_API_KEY || "").trim();
-  if (!key) throw new Error("no_av_key");
-  const url = `https://www.alphavantage.co/query?function=TIME_SERIES_INTRADAY&symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(interval)}&apikey=${encodeURIComponent(key)}&outputsize=compact`;
-  const res = await fetchWithTimeout(url, { method: "GET" }, 8000);
-  if (!res.ok) throw new Error("av_bad");
-  const j = await safeJson(res);
-  const seriesKey = Object.keys(j || {}).find((k) => k.toLowerCase().includes("time series"));
-  const series = seriesKey ? j[seriesKey] : null;
-  if (!series) throw new Error("av_parse");
-  const out = [];
-  for (const [dt, v] of Object.entries(series)) {
-    const t = Date.parse(dt);
-    const o = Number(v["1. open"]), h = Number(v["2. high"]), l = Number(v["3. low"]), c = Number(v["4. close"]);
-    if ([t, o, h, l, c].every(Number.isFinite)) out.push({ t, o, h, l, c });
+  const keys = splitKeys(env.ALPHAVANTAGE_API_KEY);
+  if (!keys.length) throw new Error("no_av_key");
+  for (const key of keys) {
+    const url = `https://www.alphavantage.co/query?function=TIME_SERIES_INTRADAY&symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(interval)}&apikey=${encodeURIComponent(key)}&outputsize=compact`;
+    const res = await fetchWithTimeout(url, { method: "GET" }, 8000);
+    if (!res.ok) continue;
+    const j = await safeJson(res);
+    const seriesKey = Object.keys(j || {}).find((k) => k.toLowerCase().includes("time series"));
+    const series = seriesKey ? j[seriesKey] : null;
+    if (!series) continue;
+    const out = [];
+    for (const [dt, v] of Object.entries(series)) {
+      const t = Date.parse(dt);
+      const o = Number(v["1. open"]), h = Number(v["2. high"]), l = Number(v["3. low"]), c = Number(v["4. close"]);
+      if ([t, o, h, l, c].every(Number.isFinite)) out.push({ t, o, h, l, c });
+    }
+    out.sort((a, b) => a.t - b.t);
+    if (out.length) return out;
   }
-  out.sort((a, b) => a.t - b.t);
-  if (!out.length) throw new Error("av_empty");
-  return out;
+  throw new Error("av_empty");
 }
 async function fetchCandlesPolygon(env, symbol, fromDate, toDate) {
-  const key = String(env.POLYGON_API_KEY || "").trim();
-  if (!key) throw new Error("no_polygon_key");
-  const url = `https://api.polygon.io/v2/aggs/ticker/${encodeURIComponent(symbol)}/range/1/hour/${encodeURIComponent(fromDate)}/${encodeURIComponent(toDate)}?adjusted=true&sort=asc&limit=50000&apiKey=${encodeURIComponent(key)}`;
-  const res = await fetchWithTimeout(url, { method: "GET" }, 8000);
-  if (!res.ok) throw new Error("polygon_bad");
-  const j = await safeJson(res);
-  const arr = j?.results || [];
-  if (!Array.isArray(arr)) throw new Error("polygon_parse");
-  const out = arr
-    .map((r) => ({ t: Number(r.t), o: Number(r.o), h: Number(r.h), l: Number(r.l), c: Number(r.c) }))
-    .filter((x) => [x.t, x.o, x.h, x.l, x.c].every(Number.isFinite));
-  if (!out.length) throw new Error("polygon_empty");
-  return out;
+  const keys = splitKeys(env.POLYGON_API_KEY);
+  if (!keys.length) throw new Error("no_polygon_key");
+  for (const key of keys) {
+    const url = `https://api.polygon.io/v2/aggs/ticker/${encodeURIComponent(symbol)}/range/1/hour/${encodeURIComponent(fromDate)}/${encodeURIComponent(toDate)}?adjusted=true&sort=asc&limit=50000&apiKey=${encodeURIComponent(key)}`;
+    const res = await fetchWithTimeout(url, { method: "GET" }, 8000);
+    if (!res.ok) continue;
+    const j = await safeJson(res);
+    const arr = j?.results || [];
+    if (!Array.isArray(arr)) continue;
+    const out = arr
+      .map((r) => ({ t: Number(r.t), o: Number(r.o), h: Number(r.h), l: Number(r.l), c: Number(r.c) }))
+      .filter((x) => [x.t, x.o, x.h, x.l, x.c].every(Number.isFinite));
+    if (out.length) return out;
+  }
+  throw new Error("polygon_empty");
 }
 function snapshotFromCandles(candles) {
   const last = candles[candles.length - 1];
@@ -1853,8 +2032,13 @@ async function getCandlesWithFallback(env, cfg, market, symbol, tf) {
 function buildChartUrl(cfg, symbol, tf, candles, zones) {
   const max = Math.min(140, candles.length);
   const slice = candles.slice(Math.max(0, candles.length - max));
-  const labels = slice.map((c) => new Date(c.t).toISOString().slice(5, 16).replace("T", " "));
-  const data = slice.map((c) => c.c);
+  const data = slice.map((c) => ({
+    x: new Date(c.t).toISOString(),
+    o: c.o,
+    h: c.h,
+    l: c.l,
+    c: c.c
+  }));
 
   const annotations = [];
   for (const z of zones || []) {
@@ -1871,17 +2055,17 @@ function buildChartUrl(cfg, symbol, tf, candles, zones) {
   }
 
   const qc = {
-    type: "line",
+    type: "candlestick",
     data: {
-      labels,
       datasets: [
         {
-          label: `${symbol} (${tf}) Close`,
+          label: `${symbol} (${tf})`,
           data,
-          fill: false,
-          borderWidth: 2,
-          pointRadius: 0,
-          tension: 0.15
+          color: {
+            up: "rgba(0,200,0,.9)",
+            down: "rgba(200,0,0,.9)",
+            unchanged: "rgba(200,200,200,.7)"
+          }
         }
       ]
     },
@@ -1914,6 +2098,9 @@ function buildAnalysisPrompt(cfg, user, market, symbol, tf, snap, newsBundle) {
   const styleP = stylePrompt(cfg, user);
   const risk = user.settings.risk || "متوسط";
   const newsOn = !!user.settings.news && !!cfg.features.newsEnabled;
+  const level = user.profile?.level || "unknown";
+  const styleKey = String(user.settings.style || "GENERAL").toUpperCase();
+  const styleName = styleLabel(cfg, styleKey);
 
   let newsText = "";
   if (newsOn && newsBundle?.items?.length) {
@@ -1923,14 +2110,48 @@ function buildAnalysisPrompt(cfg, user, market, symbol, tf, snap, newsBundle) {
 
   return (
     `${base}\n\n` +
-    `User style instruction:\n${styleP}\n\n` +
-    `Market: ${market}\nSymbol: ${symbol}\nTimeframe: ${tf}\nRisk: ${risk}\n` +
+    `دستور سبک انتخابی (${styleName}):\n${styleP}\n\n` +
+    `Market: ${market}\nSymbol: ${symbol}\nTimeframe: ${tf}\nRisk: ${risk}\nUserLevel: ${level}\nStyle: ${styleKey}\n` +
     `Snapshot: lastClose=${snap.lastClose}, changePct=${snap.changePct.toFixed(2)}%, rangeHi=${snap.rangeHi}, rangeLo=${snap.rangeLo}\n` +
     `${newsText}\n` +
     "Output must be Persian, structured with headings:\n" +
     "1) خلاصه سریع\n2) بایاس و ساختار\n3) سطوح کلیدی\n4) سناریوها (اصلی/جایگزین)\n5) مدیریت ریسک و ابطال\n6) پلن کوتاه\n" +
     ZONES_SCHEMA_HINT
   );
+}
+async function analysisCacheKey(prompt) {
+  return await sha256Hex(prompt);
+}
+async function analyzeWithCache(env, cfg, user, market, symbol, tf, snap, newsBundle) {
+  const prompt = buildAnalysisPrompt(cfg, user, market, symbol, tf, snap, newsBundle);
+  const key = await analysisCacheKey(prompt);
+  const ttl = cfg.cache?.analysisTtlMs || 180000;
+  const cached = await getAnalysisCache(env, key, ttl);
+  if (cached?.payload) {
+    return { ok: true, fromCache: true, prompt, ...cached.payload };
+  }
+
+  const ai = await callAI(env, cfg, "analysis", [{ role: "user", content: prompt }], 20000);
+  let analysisText = "";
+  let zones = [];
+  if (ai.ok) {
+    analysisText = String(ai.text || "");
+    let zonesObj = extractLastJsonObject(analysisText);
+    let val = validateZones(zonesObj);
+    if (!val.ok) {
+      const repaired = await repairZonesJsonOnce(env, cfg, analysisText);
+      val = validateZones(repaired);
+    }
+    zones = val.ok ? val.zones : [];
+    if (zonesObj) {
+      const idx = analysisText.lastIndexOf("{");
+      if (idx > 0) analysisText = analysisText.slice(0, idx).trim();
+    }
+    await setAnalysisCache(env, key, { text: analysisText, zones }, ttl);
+    return { ok: true, fromCache: false, prompt, text: analysisText, zones };
+  }
+
+  return { ok: false, error: ai.error || "ai_error", prompt };
 }
 
 // ========== Level quiz ==========
@@ -1939,6 +2160,23 @@ const LEVEL_QUESTIONS = [
   { id: "q2", q: "بیشتر کدام سبک را می‌پسندی؟ (RTM/ICT/Price Action/General)" },
   { id: "q3", q: "در مدیریت ریسک، معمولا چقدر ریسک می‌کنی؟ (کم/متوسط/زیاد)" },
   { id: "q4", q: "هدف اصلی‌ات چیست؟ (اسکالپ/سوئینگ/بلندمدت)" }
+];
+const SUPPORT_FAQ = [
+  {
+    id: "payment",
+    q: "پرداخت/تایید تراکنش",
+    a: "بعد از پرداخت USDT (BEP20)، TXID را با /tx ارسال کن. تایید نهایی توسط ادمین انجام می‌شود."
+  },
+  {
+    id: "miniapp",
+    q: "ورود به مینی‌اپ",
+    a: "از داخل تلگرام وارد مینی‌اپ شو تا initData معتبر ارسال شود. در غیر این صورت احراز هویت انجام نمی‌شود."
+  },
+  {
+    id: "quota",
+    q: "سهمیه تحلیل",
+    a: "پلن رایگان: روزانه 3 بار و ماهانه 100 بار. با اشتراک محدودیت روزانه بیشتر می‌شود."
+  }
 ];
 async function evaluateLevelWithAI(env, cfg, answers) {
   const content =
@@ -2000,7 +2238,7 @@ async function hmacSha256(keyBytes, msgBytes) {
   const sig = await crypto.subtle.sign("HMAC", key, msgBytes);
   return new Uint8Array(sig);
 }
-async function verifyTelegramInitData(initData, botToken, maxAgeSec = 24 * 3600) {
+async function verifyTelegramInitData(initData, botToken, maxAgeSec = 7 * 24 * 3600) {
   try {
     const params = new URLSearchParams(initData);
     const hash = params.get("hash");
@@ -2039,7 +2277,12 @@ async function authFromRequest(request, env, cfg) {
     return { ok: true, via: "bearer", userId: "bearer", role: "owner", user: { id: 0, username: "bearer" } };
   }
 
-  const initData = request.headers.get("x-telegram-init-data") || request.headers.get("x-init-data") || "";
+  const url = new URL(request.url);
+  const initData =
+    request.headers.get("x-telegram-init-data") ||
+    request.headers.get("x-init-data") ||
+    url.searchParams.get("initData") ||
+    "";
   const botToken = String(env.BOT_TOKEN || "").trim();
   if (!initData || !botToken) return { ok: false, error: "no_init_data" };
 
@@ -2057,7 +2300,7 @@ function miniAppHtml() {
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>Market IQ MiniApp</title>
+<title>Market IQ مینی‌اپ</title>
 <style>
 :root{--bg:#0b1220;--card:rgba(255,255,255,.06);--border:rgba(255,255,255,.10);--txt:#e8eefc;--muted:rgba(255,255,255,.75)}
 *{box-sizing:border-box}
@@ -2082,7 +2325,7 @@ hr{border:none;border-top:1px solid rgba(255,255,255,.10);margin:10px 0}
 <body>
 <header>
   <div>
-    <h1>Market IQ — MiniApp</h1>
+    <h1>Market IQ — مینی‌اپ</h1>
     <div class="small" id="status">...</div>
   </div>
   <div class="row">
@@ -2100,7 +2343,7 @@ hr{border:none;border-top:1px solid rgba(255,255,255,.10);margin:10px 0}
         <div><b id="name">کاربر</b> <span class="badge" id="role">user</span> <span class="small" id="sub">اشتراک: -</span></div>
         <div class="small">امتیاز: <span id="points">0</span> | دعوت موفق: <span id="invites">0</span> | کمیسیون: <span id="commission">0</span>%</div>
       </div>
-      <div class="small">Version: ${VERSION}</div>
+      <div class="small">نسخه: ${VERSION}</div>
     </div>
 
     <div style="margin-top:10px">
@@ -2122,11 +2365,11 @@ hr{border:none;border-top:1px solid rgba(255,255,255,.10);margin:10px 0}
       <select id="market">
         <option>CRYPTO</option><option>FOREX</option><option>METALS</option><option>STOCKS</option>
       </select>
-      <input id="symbol" placeholder="Symbol مثل BTCUSDT / EURUSD / AAPL"/>
+      <input id="symbol" placeholder="نماد مثل BTCUSDT / EURUSD / AAPL"/>
     </div>
     <div style="margin-top:10px" class="row">
       <button class="btn" id="analyze">📈 تحلیل</button>
-      <button class="btn" id="newsBtn">📰 News</button>
+      <button class="btn" id="newsBtn">📰 اخبار</button>
       <button class="btn" id="copyRef">🎁 کد رفرال</button>
     </div>
     <div id="result" style="margin-top:10px"></div>
@@ -2137,8 +2380,15 @@ hr{border:none;border-top:1px solid rgba(255,255,255,.10);margin:10px 0}
     <div class="row">
       <select id="tf"><option>M15</option><option>M30</option><option>H1</option><option>H4</option><option>D1</option></select>
       <select id="risk"><option>کم</option><option>متوسط</option><option>زیاد</option></select>
-      <select id="style"><option>RTM</option><option>ICT</option><option>PRICE_ACTION</option><option>GENERAL</option><option>METHOD</option><option>CUSTOM</option></select>
-      <label class="small"><input type="checkbox" id="newsToggle"/> News</label>
+      <select id="style">
+        <option value="RTM">RTM</option>
+        <option value="ICT">ICT</option>
+        <option value="PRICE_ACTION">پرایس اکشن</option>
+        <option value="GENERAL">تحلیل عمومی</option>
+        <option value="METHOD">متد</option>
+        <option value="CUSTOM">پرامپت اختصاصی</option>
+      </select>
+      <label class="small"><input type="checkbox" id="newsToggle"/> اخبار</label>
     </div>
     <div style="margin-top:10px" class="row">
       <button class="btn" id="saveSettings">💾 ذخیره</button>
@@ -2194,11 +2444,11 @@ hr{border:none;border-top:1px solid rgba(255,255,255,.10);margin:10px 0}
   }
 
   async function refresh(){
-    status.textContent = "loading...";
+    status.textContent = "در حال بارگذاری...";
     const prof = await api("/api/profile");
-    if(!prof.ok){ status.textContent="auth error"; document.getElementById("result").innerHTML="<pre>"+JSON.stringify(prof,null,2)+"</pre>"; return; }
+    if(!prof.ok){ status.textContent="خطای احراز"; document.getElementById("result").innerHTML="<pre>"+JSON.stringify(prof,null,2)+"</pre>"; return; }
 
-    document.getElementById("name").textContent = prof.profile.name || ("User " + prof.id);
+    document.getElementById("name").textContent = prof.profile.name || ("کاربر " + prof.id);
     document.getElementById("role").textContent = prof.role;
     document.getElementById("points").textContent = prof.referral.points || 0;
     document.getElementById("invites").textContent = prof.referral.successfulInvites || 0;
@@ -2219,11 +2469,17 @@ hr{border:none;border-top:1px solid rgba(255,255,255,.10);margin:10px 0}
     const b = document.getElementById("banner");
     if(banner && banner.enabled){
       b.style.display = "block";
-      b.innerHTML = "<b>🎁 "+banner.text+"</b><div class='small'><a href='"+banner.link+"' target='_blank'>"+banner.link+"</a></div>";
+      let html = "<b>🎁 "+banner.text+"</b>";
+      if(banner.imageKey){
+        const src = "/banner?key=" + encodeURIComponent(banner.imageKey);
+        html += "<div style='margin-top:8px'><img alt='banner' style='width:100%;border-radius:12px;border:1px solid rgba(255,255,255,.15)' src='"+src+"'/></div>";
+      }
+      if(banner.link){ html += "<div class='small'><a href='"+banner.link+"' target='_blank'>"+banner.link+"</a></div>"; }
+      b.innerHTML = html;
     } else b.style.display = "none";
 
     document.getElementById("bep20").value = prof.wallet.bep20 || "";
-    status.textContent = "ok";
+    status.textContent = "آماده";
   }
 
   document.getElementById("refresh").onclick = refresh;
@@ -2245,7 +2501,7 @@ hr{border:none;border-top:1px solid rgba(255,255,255,.10);margin:10px 0}
     const symbol = document.getElementById("symbol").value.trim();
     const r = await api("/api/signals", {market, symbol});
     let html = "<pre>"+(r.text || JSON.stringify(r,null,2))+"</pre>";
-    if(r.chartUrl) html += "<hr/><div><a href='"+r.chartUrl+"' target='_blank'>Open Chart</a></div><img style='width:100%;margin-top:8px;border-radius:12px;border:1px solid rgba(255,255,255,.15)' src='"+r.chartUrl+"'/>";
+    if(r.chartUrl) html += "<hr/><div><a href='"+r.chartUrl+"' target='_blank'>نمایش چارت</a></div><img style='width:100%;margin-top:8px;border-radius:12px;border:1px solid rgba(255,255,255,.15)' src='"+r.chartUrl+"'/>";
     document.getElementById("result").innerHTML = html;
     refresh();
   };
@@ -2297,7 +2553,7 @@ function adminHtml() {
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>Market IQ Admin</title>
+<title>Market IQ پنل مدیریت</title>
 <style>
 :root{--bg:#0b1220;--card:rgba(255,255,255,.06);--border:rgba(255,255,255,.10);--txt:#e8eefc}
 *{box-sizing:border-box}
@@ -2320,12 +2576,12 @@ a{color:#9dd1ff}
 <body>
 <header>
   <div>
-    <h1>Market IQ — Admin Panel</h1>
+    <h1>Market IQ — پنل مدیریت</h1>
     <div class="small" id="status">...</div>
   </div>
   <div class="row">
-    <a class="btn" href="/" style="text-decoration:none">MiniApp</a>
-    <button class="btn" id="login">🔑 Bearer Token</button>
+    <a class="btn" href="/" style="text-decoration:none">مینی‌اپ</a>
+    <button class="btn" id="login">🔑 توکن دسترسی</button>
     <span class="badge" id="role">-</span>
   </div>
 </header>
@@ -2333,132 +2589,140 @@ a{color:#9dd1ff}
 <main>
   <div class="card">
     <div class="row">
-      <button class="btn" id="loadCfg">⟳ Load Config</button>
-      <button class="btn" id="saveCfg">💾 Save Config</button>
-      <button class="btn" id="reports">📊 Reports</button>
-      <button class="btn" id="users">👥 Users</button>
-      <button class="btn" id="payments">💳 Payments</button>
-      <button class="btn" id="tickets">🆘 Tickets</button>
-      <button class="btn" id="requests">📌 Requests</button>
-      <button class="btn" id="audit">🧾 Audit</button>
-      <button class="btn" id="broadcast">📣 Broadcast</button>
+      <button class="btn" id="loadCfg">⟳ بارگذاری تنظیمات</button>
+      <button class="btn" id="saveCfg">💾 ذخیره تنظیمات</button>
+      <button class="btn" id="reports">📊 گزارش‌ها</button>
+      <button class="btn" id="users">👥 کاربران</button>
+      <button class="btn" id="payments">💳 پرداخت‌ها</button>
+      <button class="btn" id="tickets">🆘 تیکت‌ها</button>
+      <button class="btn" id="requests">📌 درخواست‌ها</button>
+      <button class="btn" id="audit">🧾 لاگ</button>
+      <button class="btn" id="broadcast">📣 ارسال همگانی</button>
     </div>
-    <div class="small">نکته: بعضی فیلدها Owner-only هستند (Wallet/Prompts/Styles/Points/Commission/News Sources/Security).</div>
+    <div class="small">نکته: برخی فیلدها ممکن است محدود باشند و در صورت نبود دسترسی نادیده گرفته می‌شوند.</div>
   </div>
 
   <div class="card">
-    <h3 style="margin:0 0 8px 0;font-size:14px">Config Editor</h3>
+    <h3 style="margin:0 0 8px 0;font-size:14px">ویرایشگر تنظیمات</h3>
 
     <div class="row">
       <div style="flex:1;min-width:240px">
-        <label class="small">Public Wallet (Owner-only)</label>
+        <label class="small">ولت عمومی (Owner)</label>
         <input id="walletPublic" placeholder="0x..."/>
       </div>
       <div style="flex:1;min-width:160px">
-        <label class="small">Sub Price USDT</label>
+        <label class="small">قیمت اشتراک (USDT)</label>
         <input id="subPrice" type="number" step="0.1"/>
       </div>
       <div style="flex:1;min-width:160px">
-        <label class="small">Sub Duration Days</label>
+        <label class="small">مدت اشتراک (روز)</label>
         <input id="subDays" type="number"/>
       </div>
       <div style="flex:1;min-width:160px">
-        <label class="small">Sub Daily Limit</label>
+        <label class="small">سهمیه روزانه اشتراک</label>
         <input id="subLimit" type="number"/>
       </div>
     </div>
 
     <div class="row" style="margin-top:10px">
       <div style="flex:1;min-width:160px">
-        <label class="small">Free Daily</label>
+        <label class="small">سهمیه روزانه رایگان</label>
         <input id="freeDaily" type="number"/>
       </div>
       <div style="flex:1;min-width:160px">
-        <label class="small">Free Monthly</label>
+        <label class="small">سهمیه ماهانه رایگان</label>
         <input id="freeMonthly" type="number"/>
       </div>
       <div style="flex:1;min-width:160px">
-        <label class="small">Banner Enabled</label>
+        <label class="small">فعال‌سازی بنر</label>
         <select id="bannerEnabled"><option value="true">true</option><option value="false">false</option></select>
       </div>
     </div>
 
     <div class="row" style="margin-top:10px">
       <div style="flex:1;min-width:240px">
-        <label class="small">Banner Text</label>
+        <label class="small">متن بنر</label>
         <input id="bannerText"/>
       </div>
       <div style="flex:1;min-width:240px">
-        <label class="small">Banner Link</label>
+        <label class="small">لینک بنر</label>
         <input id="bannerLink"/>
+      </div>
+      <div style="flex:1;min-width:240px">
+        <label class="small">کلید تصویر بنر (R2)</label>
+        <input id="bannerImageKey" placeholder="banners/top.png"/>
       </div>
     </div>
 
     <div style="margin-top:10px">
-      <label class="small">Base Prompt (Owner-only recommended)</label>
+      <label class="small">پرامپت پایه (Owner)</label>
       <textarea id="basePrompt" rows="5"></textarea>
     </div>
 
     <div style="margin-top:10px">
-      <label class="small">Vision Prompt (Owner-only recommended)</label>
+      <label class="small">پرامپت Vision (Owner)</label>
       <textarea id="visionPrompt" rows="4"></textarea>
     </div>
 
     <div style="margin-top:10px">
-      <label class="small">Per-Style Prompts (JSON, Owner-only)</label>
+      <label class="small">پرامپت‌های هر سبک (JSON)</label>
       <textarea id="perStyle" rows="6"></textarea>
     </div>
 
     <div style="margin-top:10px">
-      <label class="small">Styles (JSON, Owner-only)</label>
+      <label class="small">سبک‌ها (JSON)</label>
       <textarea id="stylesJson" rows="6"></textarea>
     </div>
 
     <div style="margin-top:10px">
-      <label class="small">News (JSON, Owner-only) — rss/noiseFilters/ttlMs</label>
+      <label class="small">اخبار (JSON) — rss/noiseFilters/ttlMs</label>
       <textarea id="newsJson" rows="6"></textarea>
     </div>
 
     <div class="row" style="margin-top:10px">
       <div style="flex:1;min-width:160px">
-        <label class="small">Points per invite (Owner-only)</label>
+        <label class="small">امتیاز هر دعوت</label>
         <input id="pInvite" type="number"/>
       </div>
       <div style="flex:1;min-width:160px">
-        <label class="small">Redeem free sub points (Owner-only)</label>
+        <label class="small">امتیاز تبدیل به اشتراک رایگان</label>
         <input id="pRedeem" type="number"/>
       </div>
       <div style="flex:1;min-width:160px">
-        <label class="small">Buy sub points (Owner-only)</label>
+        <label class="small">امتیاز خرید اشتراک</label>
         <input id="pBuy" type="number"/>
       </div>
     </div>
 
     <div class="row" style="margin-top:10px">
       <div style="flex:1;min-width:160px">
-        <label class="small">Commission step % (Owner-only)</label>
+        <label class="small">گام کمیسیون (%)</label>
         <input id="cStep" type="number"/>
       </div>
       <div style="flex:1;min-width:160px">
-        <label class="small">Commission max % (Owner-only)</label>
+        <label class="small">حداکثر کمیسیون (%)</label>
         <input id="cMax" type="number"/>
       </div>
     </div>
 
     <div class="row" style="margin-top:10px">
       <div style="flex:1;min-width:160px">
-        <label class="small">Feature flags (JSON)</label>
+        <label class="small">ویژگی‌ها (JSON)</label>
         <textarea id="featuresJson" rows="3"></textarea>
       </div>
       <div style="flex:1;min-width:160px">
-        <label class="small">Security (JSON, Owner-only)</label>
+        <label class="small">کش تحلیل (JSON)</label>
+        <textarea id="cacheJson" rows="3"></textarea>
+      </div>
+      <div style="flex:1;min-width:160px">
+        <label class="small">امنیت (JSON)</label>
         <textarea id="securityJson" rows="3"></textarea>
       </div>
     </div>
 
     <div class="row" style="margin-top:10px">
       <div style="flex:1;min-width:160px">
-        <label class="small">Rollback config (Owner-only) — verKey</label>
+        <label class="small">بازگردانی تنظیمات — verKey</label>
         <input id="rollbackKey" placeholder="marketiq:config:ver:...."/>
       </div>
       <button class="btn" id="rollbackBtn">⟲ Rollback</button>
@@ -2466,7 +2730,7 @@ a{color:#9dd1ff}
   </div>
 
   <div class="card">
-    <h3 style="margin:0 0 8px 0;font-size:14px">Output</h3>
+    <h3 style="margin:0 0 8px 0;font-size:14px">خروجی</h3>
     <pre id="out"></pre>
   </div>
 </main>
@@ -2496,13 +2760,13 @@ a{color:#9dd1ff}
 
   async function whoami(){
     const r = await api("/api/admin/whoami");
-    roleBadge.textContent = r && r.ok ? r.role : "unauth";
+    roleBadge.textContent = r && r.ok ? r.role : "عدم دسترسی";
   }
 
   async function loadCfg(){
-    status.textContent="loading...";
+    status.textContent="در حال بارگذاری...";
     const r = await api("/api/admin/config/get");
-    if(!r.ok){ status.textContent="auth/error"; setOut(r); return; }
+    if(!r.ok){ status.textContent="خطای دسترسی"; setOut(r); return; }
     const c = r.cfg;
 
     document.getElementById("walletPublic").value = c.walletPublic || "";
@@ -2516,6 +2780,7 @@ a{color:#9dd1ff}
     document.getElementById("bannerEnabled").value = String(!!c.banner.enabled);
     document.getElementById("bannerText").value = c.banner.text || "";
     document.getElementById("bannerLink").value = c.banner.link || "";
+    document.getElementById("bannerImageKey").value = c.banner.imageKey || "";
 
     document.getElementById("basePrompt").value = c.prompts.base || "";
     document.getElementById("visionPrompt").value = c.prompts.vision || "";
@@ -2531,20 +2796,22 @@ a{color:#9dd1ff}
     document.getElementById("cMax").value = c.commission.maxPct;
 
     document.getElementById("featuresJson").value = JSON.stringify(c.features || {}, null, 2);
+    document.getElementById("cacheJson").value = JSON.stringify(c.cache || {}, null, 2);
     document.getElementById("securityJson").value = JSON.stringify(c.security || {}, null, 2);
 
-    status.textContent="ok";
-    setOut({ok:true, hint:"Loaded. Owner-only fields will be ignored if you're not Owner."});
+    status.textContent="آماده";
+    setOut({ok:true, hint:"بارگذاری شد. فیلدهای محدود به Owner برای سایر نقش‌ها نادیده گرفته می‌شود."});
   }
 
   async function saveCfg(){
-    status.textContent="saving...";
-    let perStyle={}, stylesJson={}, newsJson={}, featuresJson={}, securityJson={};
-    try{ perStyle = JSON.parse(document.getElementById("perStyle").value || "{}"); }catch(e){ setOut("Invalid perStyle JSON"); status.textContent="error"; return; }
-    try{ stylesJson = JSON.parse(document.getElementById("stylesJson").value || "{}"); }catch(e){ setOut("Invalid styles JSON"); status.textContent="error"; return; }
-    try{ newsJson = JSON.parse(document.getElementById("newsJson").value || "{}"); }catch(e){ setOut("Invalid news JSON"); status.textContent="error"; return; }
-    try{ featuresJson = JSON.parse(document.getElementById("featuresJson").value || "{}"); }catch(e){ setOut("Invalid features JSON"); status.textContent="error"; return; }
-    try{ securityJson = JSON.parse(document.getElementById("securityJson").value || "{}"); }catch(e){ setOut("Invalid security JSON"); status.textContent="error"; return; }
+    status.textContent="در حال ذخیره...";
+    let perStyle={}, stylesJson={}, newsJson={}, featuresJson={}, cacheJson={}, securityJson={};
+    try{ perStyle = JSON.parse(document.getElementById("perStyle").value || "{}"); }catch(e){ setOut("JSON پرامپت سبک‌ها نامعتبر است"); status.textContent="خطا"; return; }
+    try{ stylesJson = JSON.parse(document.getElementById("stylesJson").value || "{}"); }catch(e){ setOut("JSON سبک‌ها نامعتبر است"); status.textContent="خطا"; return; }
+    try{ newsJson = JSON.parse(document.getElementById("newsJson").value || "{}"); }catch(e){ setOut("JSON اخبار نامعتبر است"); status.textContent="خطا"; return; }
+    try{ featuresJson = JSON.parse(document.getElementById("featuresJson").value || "{}"); }catch(e){ setOut("JSON ویژگی‌ها نامعتبر است"); status.textContent="خطا"; return; }
+    try{ cacheJson = JSON.parse(document.getElementById("cacheJson").value || "{}"); }catch(e){ setOut("JSON کش نامعتبر است"); status.textContent="خطا"; return; }
+    try{ securityJson = JSON.parse(document.getElementById("securityJson").value || "{}"); }catch(e){ setOut("JSON امنیت نامعتبر است"); status.textContent="خطا"; return; }
 
     const patch = {
       walletPublic: document.getElementById("walletPublic").value.trim(),
@@ -2560,7 +2827,8 @@ a{color:#9dd1ff}
       banner: {
         enabled: document.getElementById("bannerEnabled").value === "true",
         text: document.getElementById("bannerText").value,
-        link: document.getElementById("bannerLink").value
+        link: document.getElementById("bannerLink").value,
+        imageKey: document.getElementById("bannerImageKey").value.trim()
       },
       prompts: {
         base: document.getElementById("basePrompt").value,
@@ -2579,18 +2847,19 @@ a{color:#9dd1ff}
         maxPct: Number(document.getElementById("cMax").value)
       },
       features: featuresJson,
+      cache: cacheJson,
       security: securityJson
     };
 
     const r = await api("/api/admin/config/set", patch);
     setOut(r);
-    status.textContent = r.ok ? "saved" : "error";
+    status.textContent = r.ok ? "ذخیره شد" : "خطا";
     if(r.ok) loadCfg();
   }
 
   async function doRollback(){
     const verKey = document.getElementById("rollbackKey").value.trim();
-    if(!verKey){ setOut("verKey required"); return; }
+    if(!verKey){ setOut("verKey لازم است"); return; }
     const r = await api("/api/admin/config/rollback", {verKey});
     setOut(r);
   }
@@ -2626,15 +2895,15 @@ a{color:#9dd1ff}
   }
 
   async function broadcast(){
-    const msg = prompt("Broadcast message (Owner only):");
+    const msg = prompt("متن پیام همگانی:");
     if(!msg) return;
     const r = await api("/api/admin/broadcast/start", {text: msg});
     setOut(r);
   }
 
   document.getElementById("login").onclick = () => {
-    const t = prompt("Paste ADMIN_BEARER_TOKEN (optional):");
-    if(t){ localStorage.setItem("admin_bearer", t.trim()); alert("Saved in localStorage. Reload."); location.reload(); }
+    const t = prompt("توکن ADMIN_BEARER_TOKEN را وارد کن:");
+    if(t){ localStorage.setItem("admin_bearer", t.trim()); alert("ذخیره شد. صفحه را رفرش کن."); location.reload(); }
   };
 
   document.getElementById("loadCfg").onclick = loadCfg;
@@ -2654,6 +2923,24 @@ a{color:#9dd1ff}
 </script>
 </body>
 </html>`;
+}
+
+async function handleBannerAsset(request, env, cfg) {
+  if (!env.BOT_R2) return new Response("no_r2", { status: 404 });
+  const url = new URL(request.url);
+  const key = url.searchParams.get("key") || cfg.banner?.imageKey || "";
+  if (!key) return new Response("no_key", { status: 404 });
+  try {
+    const obj = await env.BOT_R2.get(key);
+    if (!obj) return new Response("not_found", { status: 404 });
+    const headers = new Headers();
+    headers.set("cache-control", "public, max-age=3600");
+    headers.set("content-type", obj.httpMetadata?.contentType || "image/png");
+    return new Response(obj.body, { status: 200, headers });
+  } catch (e) {
+    console.error("R2 banner error", e);
+    return new Response("error", { status: 500 });
+  }
 }
 
 // ========== Responses ==========
@@ -2776,26 +3063,14 @@ async function handleMiniAppApi(request, env, cfg) {
       let newsBundle = null;
       if (user.settings.news && cfg.features.newsEnabled) newsBundle = await getNewsBundle(env, cfg, market, symbol);
 
-      const prompt = buildAnalysisPrompt(cfg, user, market, symbol, user.settings.tf, snap, newsBundle);
-      const ai = await callAI(env, cfg, "analysis", [{ role: "user", content: prompt }], 20000);
-
+      const analysis = await analyzeWithCache(env, cfg, user, market, symbol, user.settings.tf, snap, newsBundle);
       let analysisText = "";
       let zones = [];
-      if (ai.ok) {
-        analysisText = String(ai.text || "");
-        let zonesObj = extractLastJsonObject(analysisText);
-        let val = validateZones(zonesObj);
-        if (!val.ok) {
-          const repaired = await repairZonesJsonOnce(env, cfg, analysisText);
-          val = validateZones(repaired);
-        }
-        zones = val.ok ? val.zones : [];
-        if (zonesObj) {
-          const idx = analysisText.lastIndexOf("{");
-          if (idx > 0) analysisText = analysisText.slice(0, idx).trim();
-        }
+      if (analysis.ok) {
+        analysisText = String(analysis.text || "");
+        zones = analysis.zones || [];
       } else {
-        analysisText = "AI در دسترس نیست یا خطا داد: " + (ai.error || "unknown");
+        analysisText = "AI در دسترس نیست یا خطا داد: " + (analysis.error || "unknown");
       }
 
       const chartUrl = cfg.features.chartEnabled ? buildChartUrl(cfg, symbol, user.settings.tf, candles, zones) : "";
@@ -2823,6 +3098,7 @@ async function handleMiniAppApi(request, env, cfg) {
     if (request.method === "GET") return jsonResponse({ ok: true, wallet: user.wallet });
     const body = await request.json().catch(() => ({}));
     const addr = String(body.bep20 || "").trim();
+    if (addr && !isValidEvmAddress(addr)) return jsonResponse({ ok: false, error: "invalid_wallet" }, 400);
     user.wallet.bep20 = addr;
     await saveUser(env, user);
     return jsonResponse({ ok: true, wallet: user.wallet });
@@ -2845,7 +3121,7 @@ async function handleMiniAppApi(request, env, cfg) {
 
 // ========== Admin APIs ==========
 function maskUserForAdmin(role, u) {
-  const owner = role === "owner";
+  const owner = role === "owner" || role === "admin";
   return {
     id: u.id,
     createdAt: u.createdAt,
@@ -2900,7 +3176,7 @@ async function handleAdminApi(request, env, cfg) {
       await notifyOwners(env, `🚨 هشدار: تغییر ولت عمومی توسط ${uid}\nWallet: ${String(patch.walletPublic).trim()}`);
       await notifyStaff(env, `ℹ️ ولت عمومی تغییر کرد.\nBy: ${uid}\nWallet: ${String(patch.walletPublic).trim()}`);
     }
-    return jsonResponse({ ok: true, cfg: saved, note: role === "admin" ? "Owner-only fields ignored for admin." : "Saved." });
+    return jsonResponse({ ok: true, cfg: saved, note: "ذخیره شد." });
   }
 
   if (path === "/api/admin/config/rollback" && request.method === "POST") {
@@ -2921,8 +3197,8 @@ async function handleAdminApi(request, env, cfg) {
     const limit = clamp(safeParseInt(url.searchParams.get("limit"), 50), 1, 200);
     const cursor = url.searchParams.get("cursor") || "";
     const full = url.searchParams.get("full") === "1";
-    const isOwner = role === "owner";
-    if (full && !isOwner) return jsonResponse({ ok: false, error: "owner_only_full" }, 403);
+    const isPrivileged = role === "owner" || role === "admin";
+    if (full && !isPrivileged) return jsonResponse({ ok: false, error: "owner_only_full" }, 403);
 
     const r = await kvList(env, `${KV_PREFIX}user:`, limit, cursor || undefined);
     const users = [];
@@ -2942,7 +3218,7 @@ async function handleAdminApi(request, env, cfg) {
   }
 
   if (path === "/api/admin/users/ban" && request.method === "POST") {
-    if (role !== "owner") return jsonResponse({ ok: false, error: "owner_only" }, 403);
+    if (!(role === "owner" || role === "admin")) return jsonResponse({ ok: false, error: "owner_only" }, 403);
     const body = await request.json().catch(() => ({}));
     const id = String(body.id || "").trim();
     const hours = clamp(safeParseInt(body.hours, 24), 1, 24 * 365);
@@ -2959,7 +3235,7 @@ async function handleAdminApi(request, env, cfg) {
   }
 
   if (path === "/api/admin/users/unban" && request.method === "POST") {
-    if (role !== "owner") return jsonResponse({ ok: false, error: "owner_only" }, 403);
+    if (!(role === "owner" || role === "admin")) return jsonResponse({ ok: false, error: "owner_only" }, 403);
     const body = await request.json().catch(() => ({}));
     const id = String(body.id || "").trim();
     const u = await kvGetJson(env, kUser(id));
@@ -3045,7 +3321,7 @@ async function handleAdminApi(request, env, cfg) {
   }
 
   if (path === "/api/admin/audit/list") {
-    if (role !== "owner") return jsonResponse({ ok: false, error: "owner_only" }, 403);
+    if (!(role === "owner" || role === "admin")) return jsonResponse({ ok: false, error: "owner_only" }, 403);
     const limit = clamp(safeParseInt(url.searchParams.get("limit"), 50), 1, 200);
     const cursor = url.searchParams.get("cursor") || "";
     const r = await kvList(env, `${KV_PREFIX}auditidx:`, limit, cursor || undefined);
@@ -3060,7 +3336,7 @@ async function handleAdminApi(request, env, cfg) {
   }
 
   if (path === "/api/admin/broadcast/start" && request.method === "POST") {
-    if (role !== "owner") return jsonResponse({ ok: false, error: "owner_only" }, 403);
+    if (!(role === "owner" || role === "admin")) return jsonResponse({ ok: false, error: "owner_only" }, 403);
     if (!cfg.features.broadcastEnabled) return jsonResponse({ ok: false, error: "broadcast_disabled" }, 400);
 
     const body = await request.json().catch(() => ({}));
@@ -3123,7 +3399,7 @@ function welcomeText(env) {
     "• تحلیل/سیگنال با چارت زون‌دار (Demand/Supply)\n" +
     "• مدیریت سهمیه و اشتراک\n" +
     "• رفرال و امتیاز\n" +
-    "• News (اختیاری)\n\n" +
+    "• اخبار (اختیاری)\n\n" +
     "از منو استفاده کن یا /signals را بزن."
   );
 }
@@ -3314,7 +3590,7 @@ async function handleSettingsWizard(env, cfg, chatId, userId, user, text) {
   if (t.startsWith("📰")) {
     user.settings.news = !user.settings.news;
     await saveUser(env, user);
-    await tgSendMessage(env, chatId, `News اکنون: ${user.settings.news ? "روشن ✅" : "خاموش ❌"}`, settingsKeyboard(cfg, user));
+    await tgSendMessage(env, chatId, `اخبار اکنون: ${user.settings.news ? "روشن ✅" : "خاموش ❌"}`, settingsKeyboard(cfg, user));
     return;
   }
 
@@ -3480,26 +3756,14 @@ async function runSignalsAndSend(env, cfg, chatId, userId, user, market, symbol)
       await tgSendMessage(env, chatId, trunc(newsMsg, 3800), mainMenuKeyboard());
     }
 
-    const prompt = buildAnalysisPrompt(cfg, user, market, symbol, user.settings.tf, snap, newsBundle);
-    const ai = await callAI(env, cfg, "analysis", [{ role: "user", content: prompt }], 20000);
-
+    const analysis = await analyzeWithCache(env, cfg, user, market, symbol, user.settings.tf, snap, newsBundle);
     let analysisText = "";
     let zones = [];
-    if (ai.ok) {
-      analysisText = String(ai.text || "");
-      let zonesObj = extractLastJsonObject(analysisText);
-      let val = validateZones(zonesObj);
-      if (!val.ok) {
-        const repaired = await repairZonesJsonOnce(env, cfg, analysisText);
-        val = validateZones(repaired);
-      }
-      zones = val.ok ? val.zones : [];
-      if (zonesObj) {
-        const idx = analysisText.lastIndexOf("{");
-        if (idx > 0) analysisText = analysisText.slice(0, idx).trim();
-      }
+    if (analysis.ok) {
+      analysisText = String(analysis.text || "");
+      zones = analysis.zones || [];
     } else {
-      analysisText = "❌ AI در دسترس نیست یا خطا داد.\n" + (ai.error || "");
+      analysisText = "❌ AI در دسترس نیست یا خطا داد.\n" + (analysis.error || "");
       zones = [];
     }
 
@@ -3578,6 +3842,7 @@ async function handleLevelFlow(env, cfg, chatId, userId, user, text) {
   const allowed = availableStylesForUser(cfg, user);
   user.settings.style = allowed.includes(s.style) ? s.style : user.settings.style;
   user.settings.news = !!s.news;
+  user.profile.level = r.result.level;
 
   await saveUser(env, user);
 
@@ -3587,7 +3852,7 @@ async function handleLevelFlow(env, cfg, chatId, userId, user, text) {
     `خلاصه: ${r.result.summary_fa}\n\n` +
     `پیشنهاد بازار: ${r.result.recommended_market}\n` +
     `تنظیمات پیشنهادی اعمال شد ✅\n` +
-    `TF=${user.settings.tf} | Risk=${user.settings.risk} | Style=${styleLabel(cfg, user.settings.style)} | News=${user.settings.news ? "ON" : "OFF"}\n\n` +
+    `TF=${user.settings.tf} | Risk=${user.settings.risk} | Style=${styleLabel(cfg, user.settings.style)} | اخبار=${user.settings.news ? "روشن" : "خاموش"}\n\n` +
     `اگر نیاز به «تعیین سطح مجدد» یا «تغییر تنظیمات» داری، از دکمه‌های زیر استفاده کن.\n`;
 
   await tgSendMessage(env, chatId, msg, mainMenuKeyboard(), { reply_markup: levelResultInline() });
@@ -3653,7 +3918,27 @@ async function handleMessage(env, cfg, chatId, userId, user, text, msg) {
     await handleLevelFlow(env, cfg, chatId, userId, user, t);
     return;
   }
+  if (user.state.flow === "support_menu") {
+    if (t === "/menu" || t === "⬅️ منو") {
+      user.state.flow = "idle";
+      await saveUser(env, user);
+      await tgSendMessage(env, chatId, "منوی اصلی:", mainMenuKeyboard());
+      return;
+    }
+    user.state.flow = "idle";
+    await saveUser(env, user);
+    const ticket = await createTicket(env, userId, t);
+    await tgSendMessage(env, chatId, "✅ پیام شما ثبت شد. پشتیبانی پاسخ می‌دهد.", mainMenuKeyboard());
+    await notifyStaff(env, `🆘 تیکت جدید\nTicket: ${ticket.id}\nUser: ${userId}\nText: ${trunc(t, 700)}`);
+    return;
+  }
   if (user.state.flow === "ticket_write") {
+    if (t === "/menu" || t === "⬅️ منو") {
+      user.state.flow = "idle";
+      await saveUser(env, user);
+      await tgSendMessage(env, chatId, "منوی اصلی:", mainMenuKeyboard());
+      return;
+    }
     user.state.flow = "idle";
     await saveUser(env, user);
     const ticket = await createTicket(env, userId, t);
@@ -3746,8 +4031,9 @@ async function handleMessage(env, cfg, chatId, userId, user, text, msg) {
       `نام: ${user.profile.name || "-"}\n` +
       `شماره: ${user.profile.phone || "-"}\n` +
       `تجربه: ${user.profile.experience || "-"}\n` +
+      `سطح: ${user.profile.level || "-"}\n` +
       `بازار علاقه‌مند: ${user.profile.favoriteMarket || "-"}\n\n` +
-      `🎛 تنظیمات: TF=${user.settings.tf} | Risk=${user.settings.risk} | Style=${styleLabel(cfg, user.settings.style)} | News=${user.settings.news ? "ON" : "OFF"}\n\n` +
+      `🎛 تنظیمات: TF=${user.settings.tf} | Risk=${user.settings.risk} | Style=${styleLabel(cfg, user.settings.style)} | اخبار=${user.settings.news ? "روشن" : "خاموش"}\n\n` +
       `💳 اشتراک: ${isSub ? "فعال ✅" : "غیرفعال"} | تا: ${until}\n` +
       `⚡ سهمیه روزانه: ${quotaBar(view.dailyUsed, view.dailyLimit)}\n` +
       (view.monthlyLimit !== null ? `📅 سهمیه ماهانه: ${quotaBar(view.monthlyUsed, view.monthlyLimit)}\n` : "") +
@@ -3791,7 +4077,13 @@ async function handleMessage(env, cfg, chatId, userId, user, text, msg) {
       await tgSendMessage(env, chatId, r.error, mainMenuKeyboard());
       return;
     }
-    await tgSendMessage(env, chatId, "✅ TXID ثبت شد و در انتظار تایید است.", mainMenuKeyboard());
+    let verifyNote = "";
+    if (r.record?.verify?.checked) {
+      verifyNote = r.record.verify.match
+        ? "\n✅ بررسی هوشمند بلاکچین: پرداخت به ولت صحیح تشخیص داده شد."
+        : "\n⚠️ بررسی هوشمند بلاکچین: پرداخت به ولت تأیید نشد (نیاز به بررسی ادمین).";
+    }
+    await tgSendMessage(env, chatId, "✅ TXID ثبت شد و در انتظار تایید است." + verifyNote, mainMenuKeyboard());
     await notifyStaff(env, `💳 پرداخت جدید (pending)\nUser: ${userId}\nTXID: ${txid}`, {
       inline_keyboard: [[{ text: "✅ Approve", callback_data: `pay:approve:${txid}` }, { text: "❌ Reject", callback_data: `pay:reject:${txid}` }]]
     });
@@ -3842,6 +4134,10 @@ async function handleMessage(env, cfg, chatId, userId, user, text, msg) {
   if (t.startsWith("/setwallet")) {
     if (!isAdminId(env, userId)) return tgSendMessage(env, chatId, "⛔️ دسترسی ندارید.", mainMenuKeyboard());
     const addr = t.split(/\s+/)[1] || "";
+    if (addr && !isValidEvmAddress(addr)) {
+      await tgSendMessage(env, chatId, "❌ آدرس ولت نامعتبر است. فرمت باید 0x... باشد.", mainMenuKeyboard());
+      return;
+    }
     const old = (await publicWallet(env, cfg)) || "";
 
     // Owner-only recommended, but allowed for admin too per spec; we still ALARM owners.
@@ -3861,6 +4157,14 @@ async function handleMessage(env, cfg, chatId, userId, user, text, msg) {
     cfg.limits.freeDaily = Math.max(1, n);
     await saveConfig(env, userId, cfg, "setfreelimit");
     await tgSendMessage(env, chatId, `✅ free daily limit = ${cfg.limits.freeDaily}`, mainMenuKeyboard());
+    return;
+  }
+  if (t.startsWith("/setfreemonth")) {
+    if (!isAdminId(env, userId)) return tgSendMessage(env, chatId, "⛔️ دسترسی ندارید.", mainMenuKeyboard());
+    const n = safeParseInt(t.split(/\s+/)[1], cfg.limits.freeMonthly);
+    cfg.limits.freeMonthly = Math.max(cfg.limits.freeDaily, Math.max(1, n));
+    await saveConfig(env, userId, cfg, "setfreemonth");
+    await tgSendMessage(env, chatId, `✅ free monthly limit = ${cfg.limits.freeMonthly}`, mainMenuKeyboard());
     return;
   }
 
@@ -3956,9 +4260,13 @@ async function handleMessage(env, cfg, chatId, userId, user, text, msg) {
   }
 
   if (t === "/support") {
-    user.state.flow = "ticket_write";
+    user.state.flow = "support_menu";
     await saveUser(env, user);
-    await tgSendMessage(env, chatId, "🆘 پیام پشتیبانی را بنویس. (برای برگشت /menu)", backToMenuKeyboard());
+    const faqText =
+      "🆘 قبل از ارسال تیکت، یکی از سوالات پرتکرار زیر را ببین:\n\n" +
+      SUPPORT_FAQ.map((f, i) => `${i + 1}) ${f.q}`).join("\n") +
+      "\n\nاگر پاسخ را پیدا نکردی، روی «ارسال تیکت جدید» بزن.";
+    await tgSendMessage(env, chatId, faqText, mainMenuKeyboard(), { reply_markup: supportFaqInline() });
     return;
   }
 
@@ -3966,7 +4274,7 @@ async function handleMessage(env, cfg, chatId, userId, user, text, msg) {
     const msg5 =
       "📚 آموزش\n\n" +
       "1) از /signals برای انتخاب Market و Symbol استفاده کن.\n" +
-      "2) در /settings تایم‌فریم، ریسک، سبک و News را تنظیم کن.\n" +
+      "2) در /settings تایم‌فریم، ریسک، سبک و اخبار را تنظیم کن.\n" +
       "3) برای خرید اشتراک /buy و سپس /tx <TXID>.\n" +
       "4) رفرال: /ref\n" +
       "5) تعیین سطح: /level\n" +
@@ -3977,14 +4285,14 @@ async function handleMessage(env, cfg, chatId, userId, user, text, msg) {
 
   if (t === "/miniapp") {
     const url = "/";
-    const msg6 = `🧩 Mini App آماده است:\n${url}\n\n(برای باز شدن داخل تلگرام، از دکمه زیر استفاده کن)`;
-    await tgSendMessage(env, chatId, msg6, mainMenuKeyboard(), { reply_markup: { inline_keyboard: [[{ text: "Open MiniApp", web_app: { url } }]] } });
+    const msg6 = `🧩 مینی‌اپ آماده است:\n${url}\n\n(برای باز شدن داخل تلگرام، از دکمه زیر استفاده کن)`;
+    await tgSendMessage(env, chatId, msg6, mainMenuKeyboard(), { reply_markup: { inline_keyboard: [[{ text: "باز کردن مینی‌اپ", web_app: { url } }]] } });
     return;
   }
 
   // Owner-only tools
   if (t === "/setwebhook") {
-    if (!isOwnerId(env, userId)) return tgSendMessage(env, chatId, "⛔️ فقط Owner.", mainMenuKeyboard());
+    if (!isAdminId(env, userId)) return tgSendMessage(env, chatId, "⛔️ فقط Admin/Owner.", mainMenuKeyboard());
     const wh = String(env.WEBHOOK_URL || "").trim();
     const secret = String(env.TELEGRAM_SECRET_TOKEN || "").trim();
     if (!wh) return tgSendMessage(env, chatId, "WEBHOOK_URL تنظیم نشده.", mainMenuKeyboard());
@@ -3993,14 +4301,14 @@ async function handleMessage(env, cfg, chatId, userId, user, text, msg) {
     return;
   }
   if (t === "/getwebhook") {
-    if (!isOwnerId(env, userId)) return tgSendMessage(env, chatId, "⛔️ فقط Owner.", mainMenuKeyboard());
+    if (!isAdminId(env, userId)) return tgSendMessage(env, chatId, "⛔️ فقط Admin/Owner.", mainMenuKeyboard());
     const r = await tgCall(env, "getWebhookInfo", {});
     await tgSendMessage(env, chatId, `getWebhookInfo:\n${JSON.stringify(r)}`, mainMenuKeyboard());
     return;
   }
 
   if (t.startsWith("/ban")) {
-    if (!isOwnerId(env, userId)) return tgSendMessage(env, chatId, "⛔️ فقط Owner.", mainMenuKeyboard());
+    if (!isAdminId(env, userId)) return tgSendMessage(env, chatId, "⛔️ فقط Admin/Owner.", mainMenuKeyboard());
     const parts = t.split(/\s+/);
     const target = parts[1] || "";
     const hours = clamp(safeParseInt(parts[2], 24), 1, 24 * 365);
@@ -4017,7 +4325,7 @@ async function handleMessage(env, cfg, chatId, userId, user, text, msg) {
     return;
   }
   if (t.startsWith("/unban")) {
-    if (!isOwnerId(env, userId)) return tgSendMessage(env, chatId, "⛔️ فقط Owner.", mainMenuKeyboard());
+    if (!isAdminId(env, userId)) return tgSendMessage(env, chatId, "⛔️ فقط Admin/Owner.", mainMenuKeyboard());
     const target = t.split(/\s+/)[1] || "";
     const u = await kvGetJson(env, kUser(target));
     if (!u) return tgSendMessage(env, chatId, "کاربر پیدا نشد.", mainMenuKeyboard());
@@ -4111,6 +4419,23 @@ async function handleCallback(env, cfg, cq) {
     await notifyStaff(env, `⚙️ درخواست تغییر تنظیمات\nUser: ${fromId}`);
     await tgSendMessage(env, chatId, "✅ درخواست شما برای Owner/Admin ارسال شد.", mainMenuKeyboard());
     return;
+  }
+
+  if (data === "support:new") {
+    user.state.flow = "ticket_write";
+    await saveUser(env, user);
+    await tgAnswerCallback(env, id, "ارسال پیام پشتیبانی.", false);
+    await tgSendMessage(env, chatId, "✍️ پیام پشتیبانی را بنویس. (برای برگشت /menu)", backToMenuKeyboard());
+    return;
+  }
+  if (data.startsWith("support:faq:")) {
+    const fid = data.split(":")[2] || "";
+    const faq = SUPPORT_FAQ.find((f) => f.id === fid);
+    if (faq) {
+      await tgAnswerCallback(env, id, "پاسخ آماده شد.", false);
+      await tgSendMessage(env, chatId, `📌 ${faq.q}\n\n${faq.a}`, mainMenuKeyboard(), { reply_markup: supportFaqInline() });
+      return;
+    }
   }
 
   await tgAnswerCallback(env, id, "OK", false);
@@ -4259,6 +4584,12 @@ async function router(request, env, ctx) {
     return await handleTelegramWebhook(request, env, ctx);
   }
 
+  // Payment webhook (optional)
+  if (path === "/webhook/payment" && request.method === "POST") {
+    const cfg = await loadConfig(env);
+    return await handlePaymentWebhook(request, env, cfg);
+  }
+
   // Miniapp route must be ROOT
   if (path === "/" && request.method === "GET") {
     return htmlResponse(miniAppHtml());
@@ -4266,6 +4597,10 @@ async function router(request, env, ctx) {
   // Alias /miniapp -> /
   if (path === "/miniapp") {
     return new Response("", { status: 302, headers: { location: "/" } });
+  }
+  if (path === "/banner" && request.method === "GET") {
+    const cfg = await loadConfig(env);
+    return await handleBannerAsset(request, env, cfg);
   }
 
   // Admin panel
