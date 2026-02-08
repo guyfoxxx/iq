@@ -21,8 +21,8 @@
  * Bindings expected:
  * - env.BOT_KV (KV namespace binding)
  * - env.AI (optional Cloudflare AI binding)
- * - env.m_db (optional D1 binding for analysis cache, binding name: m_db)
- * - env.R2 (optional R2 bucket binding for banner images)
+ * - env.m_db (optional D1 binding for cache/logs)
+ * - env.BOT_R2 (optional R2 binding for banner assets)
  *
  * Required ENV:
  * - BOT_TOKEN
@@ -35,15 +35,15 @@
  * Optional ENV:
  * - WEBHOOK_URL (for /setwebhook)
  * - ADMIN_BEARER_TOKEN (to access admin panel outside Telegram)
- * - AI_PROVIDER=openai|gemini|compat|cloudflare
+ * - AI_PROVIDER=openai|gemini|compat|cloudflare (comma/space separated for fallback)
  * - OPENAI_API_KEY, OPENAI_MODEL
  * - OPENAI_API_KEYS (comma/space separated fallback keys)
  * - GEMINI_API_KEY, GEMINI_MODEL
  * - GEMINI_API_KEYS (comma/space separated fallback keys)
  * - AI_COMPAT_BASE_URL, AI_COMPAT_API_KEY, AI_COMPAT_MODEL
- * - AI_COMPAT_API_KEYS (comma/space separated fallback keys)
- * - BSCSCAN_API_KEY / BSCSCAN_API_KEYS (for on-chain payment verification)
- * - EVENT_WEBHOOK_URL (optional outbound webhook for events)
+ * - CLOUDFLARE_AI_MODELS (optional, comma/space list)
+ * - BSCSCAN_API_KEY, USDT_BEP20_CONTRACT
+ * - PAYMENT_WEBHOOK_SECRET (optional for /webhook/payment)
  * - Data provider keys: TWELVEDATA_API_KEY, FINNHUB_API_KEY, ALPHAVANTAGE_API_KEY, POLYGON_API_KEY
  * - Limits/points defaults: FREE_DAILY_LIMIT, FREE_MONTHLY_LIMIT, SUB_DAILY_LIMIT, SUB_PRICE_USDT, SUB_DURATION_DAYS
  * - REF_POINTS_PER_INVITE, REF_POINTS_REDEEM_FREE_SUB, REF_POINTS_BUY_SUB, REF_COMMISSION_STEP_PCT, REF_COMMISSION_MAX_PCT
@@ -64,6 +64,11 @@ const clamp = (n, a, b) => Math.max(a, Math.min(b, n));
 const pad2 = (n) => String(n).padStart(2, "0");
 const utcDateKey = (d = new Date()) => `${d.getUTCFullYear()}-${pad2(d.getUTCMonth() + 1)}-${pad2(d.getUTCDate())}`;
 const utcMonthKey = (d = new Date()) => `${d.getUTCFullYear()}-${pad2(d.getUTCMonth() + 1)}`;
+const splitKeys = (v) =>
+  String(v || "")
+    .split(/[,\s]+/g)
+    .map((s) => s.trim())
+    .filter(Boolean);
 const safeParseInt = (v, def = 0) => {
   const n = Number.parseInt(String(v ?? ""), 10);
   return Number.isFinite(n) ? n : def;
@@ -144,6 +149,10 @@ function normalizeSymbolInput(t) {
   if (clean.length < 2 || clean.length > 24) return "";
   return clean;
 }
+function isValidEvmAddress(addr) {
+  const a = String(addr || "").trim();
+  return /^0x[a-fA-F0-9]{40}$/.test(a);
+}
 function ensureBackHint(msg) {
   return `${msg}\n\n⬅️ برای برگشت: /menu`;
 }
@@ -218,7 +227,7 @@ const kCircuit = (name) => `${KV_PREFIX}cb:${name}`;
 const kMetricDay = (dayKey) => `${KV_PREFIX}m:day:${dayKey}`;
 const kActiveDayUser = (dayKey, userId) => `${KV_PREFIX}active:${dayKey}:${userId}`;
 const kBroadcastJob = (jobId) => `${KV_PREFIX}job:broadcast:${jobId}`;
-const kAnalysisCache = (hash) => `${KV_PREFIX}analysis:${hash}`;
+const kAnalysisCache = (hash) => `${KV_PREFIX}acache:${hash}`;
 
 // ========== KV helpers ==========
 async function kvGetJson(env, key) {
@@ -262,6 +271,20 @@ async function kvList(env, prefix, limit = 100, cursor = undefined) {
   } catch (e) {
     console.error("KV list error", prefix, e);
     return { keys: [], cursor: "" };
+  }
+}
+
+// ========== D1 helper (optional) ==========
+const D1_CACHE = { ready: false };
+async function ensureD1(env) {
+  if (!env.m_db || D1_CACHE.ready) return;
+  try {
+    await env.m_db.exec(
+      "CREATE TABLE IF NOT EXISTS analysis_cache (cache_key TEXT PRIMARY KEY, payload TEXT, created_at INTEGER, ttl_ms INTEGER)"
+    );
+    D1_CACHE.ready = true;
+  } catch (e) {
+    console.error("D1 init error", e);
   }
 }
 
@@ -324,39 +347,28 @@ function defaultConfig(env) {
       enabled: true,
       text: "🎁 پیشنهاد ویژه: با اشتراک Market IQ حرفه‌ای شو!",
       link: "https://t.me/",
-      imageKey: "",
-      imageUrl: ""
-    },
-    cache: {
-      analysisTtlMs: 6 * 60 * 60 * 1000
-    },
-    payments: {
-      autoVerify: true,
-      minConfirmations: 1,
-      priceTolerancePct: 2,
-      chain: "bsc",
-      usdtContractBep20: "0x55d398326f99059fF775485246999027B3197955"
+      imageKey: ""
     },
     styles: {
       RTM: { enabled: true, label: "RTM" },
       ICT: { enabled: true, label: "ICT" },
-      PRICE_ACTION: { enabled: true, label: "Price Action" },
-      GENERAL: { enabled: true, label: "General Prompt" },
-      METHOD: { enabled: true, label: "Method" },
-      CUSTOM: { enabled: true, label: "Custom Prompt" }
+      PRICE_ACTION: { enabled: true, label: "پرایس اکشن" },
+      GENERAL: { enabled: true, label: "تحلیل عمومی" },
+      METHOD: { enabled: true, label: "متد" },
+      CUSTOM: { enabled: true, label: "پرامپت اختصاصی" }
     },
     prompts: {
       base:
-        "تو Market IQ هستی، یک تحلیلگر حرفه‌ای بازار. خروجی باید فارسی، دقیق و قابل اجرا باشد. از اطلاعات زمینه‌ای (بازار، نماد، تایم‌فریم، داده لحظه‌ای، سطح کاربر و سبک انتخابی) استفاده کن و نتیجه را ساختارمند ارائه بده.",
+        "تو Market IQ هستی؛ تحلیل‌گر حرفه‌ای بازار. خروجی را همیشه فارسی و ساختاریافته ارائه کن. داده‌های زیر را حتما در تحلیل لحاظ کن و به آن‌ها ارجاع بده: تایم‌فریم، نماد، بازار، داده لحظه‌ای بازار، سطح کاربر، سبک انتخابی و پرامپت سبک.",
       vision:
         "تو Market IQ Vision هستی. تصویر چارت را تحلیل کن و مشاهدات کوتاه و تایید زون‌ها را به فارسی ارائه بده.",
       perStyle: {
-        RTM: "طبق RTM تحلیل کن: مبدا/بیس/ایمپالس، زون‌های تازه، ابطال واضح و پلن ریسک.",
-        ICT: "از مفاهیم ICT استفاده کن: لیکوییدیتی، اوردر بلاک، FVG، بایاس سشن و ابطال واضح.",
-        PRICE_ACTION: "پرایس اکشن خالص: ساختار بازار، حمایت/مقاومت، مومنتوم و ابطال واضح.",
-        GENERAL: "تحلیل تکنیکال عمومی با فاکتورهای چندگانه و ابطال واضح.",
-        METHOD: "روش: داده → بایاس → ستاپ → ریسک → پلن. کاملاً عملی و کوتاه.",
-        CUSTOM: "اگر پرامپت اختصاصی کاربر آماده است، از آن استفاده کن؛ در غیر این صورت GENERAL."
+        RTM: "با منطق RTM تحلیل کن: origin/base/impulse، زون‌های تازه، ابطال واضح و پلن ریسک.",
+        ICT: "با مفاهیم ICT: نقدینگی، order block، FVG، سشن‌ها و ابطال واضح.",
+        PRICE_ACTION: "پرایس اکشن خالص: ساختار بازار، حمایت/مقاومت، مومنتوم و ابطال.",
+        GENERAL: "تحلیل تکنیکال عمومی چندفاکتوره با ابطال واضح.",
+        METHOD: "روش: داده -> بایاس -> ستاپ -> ریسک -> پلن. عملی و کوتاه.",
+        CUSTOM: "از استراتژی اختصاصی کاربر استفاده کن؛ اگر نبود General."
       }
     },
     news: {
@@ -393,6 +405,9 @@ function defaultConfig(env) {
       visionEnabled: false, // optional
       broadcastEnabled: true
     },
+    cache: {
+      analysisTtlMs: 3 * 60 * 1000
+    },
     security: {
       // basic rate limits (best-effort; KV not atomic)
       rlWebhookPerMin: 60, // per user
@@ -426,6 +441,7 @@ function normalizeConfig(env, cfg) {
       forexCalendar: { ...d.news.forexCalendar, ...(cfg?.news?.forexCalendar || {}) }
     },
     features: { ...d.features, ...(cfg?.features || {}) },
+    cache: { ...d.cache, ...(cfg?.cache || {}) },
     security: { ...d.security, ...(cfg?.security || {}) }
   };
 
@@ -455,6 +471,7 @@ function normalizeConfig(env, cfg) {
   out.features.newsEnabled = !!out.features.newsEnabled;
   out.features.visionEnabled = !!out.features.visionEnabled;
   out.features.broadcastEnabled = !!out.features.broadcastEnabled;
+  out.cache.analysisTtlMs = clamp(safeParseInt(out.cache.analysisTtlMs, d.cache.analysisTtlMs), 30 * 1000, 30 * 60 * 1000);
 
   out.security.rlWebhookPerMin = clamp(safeParseInt(out.security.rlWebhookPerMin, d.security.rlWebhookPerMin), 10, 600);
   out.security.rlAnalyzePerMin = clamp(safeParseInt(out.security.rlAnalyzePerMin, d.security.rlAnalyzePerMin), 1, 120);
@@ -478,6 +495,48 @@ async function loadConfig(env) {
   CONFIG_CACHE.cfg = cfg;
   CONFIG_CACHE.ts = nowMs();
   return cfg;
+}
+
+// ========== Analysis cache ==========
+async function getAnalysisCache(env, cacheKey, ttlMs) {
+  const kvKey = kAnalysisCache(cacheKey);
+  const cached = await kvGetJson(env, kvKey);
+  if (cached?.ts && nowMs() - cached.ts < ttlMs) return cached;
+
+  if (env.m_db) {
+    await ensureD1(env);
+    try {
+      const res = await env.m_db.prepare("SELECT payload, created_at, ttl_ms FROM analysis_cache WHERE cache_key = ?").bind(cacheKey).first();
+      if (res?.payload && res.created_at && res.ttl_ms) {
+        if (nowMs() - res.created_at < res.ttl_ms) {
+          try {
+            return { ts: res.created_at, payload: JSON.parse(res.payload) };
+          } catch {
+            return null;
+          }
+        }
+      }
+    } catch (e) {
+      console.error("D1 cache read error", e);
+    }
+  }
+  return null;
+}
+async function setAnalysisCache(env, cacheKey, payload, ttlMs) {
+  const kvKey = kAnalysisCache(cacheKey);
+  await kvPutJson(env, kvKey, { ts: nowMs(), payload }, { expirationTtl: Math.ceil(ttlMs / 1000) });
+
+  if (env.m_db) {
+    await ensureD1(env);
+    try {
+      await env.m_db
+        .prepare("INSERT OR REPLACE INTO analysis_cache (cache_key, payload, created_at, ttl_ms) VALUES (?, ?, ?, ?)")
+        .bind(cacheKey, JSON.stringify(payload), nowMs(), ttlMs)
+        .run();
+    } catch (e) {
+      console.error("D1 cache write error", e);
+    }
+  }
 }
 
 async function auditLog(env, actorId, action, beforeObj, afterObj, meta = {}) {
@@ -521,21 +580,13 @@ function applyConfigPatchWithRBAC(env, role, cfg, patch) {
   const cur = normalizeConfig(env, cfg || {});
   const next = JSON.parse(JSON.stringify(cur));
 
-  const isOwner = role === "owner";
+  const isOwner = role === "owner" || role === "admin";
   const isAdmin = role === "admin" || role === "owner";
 
   if (!patch || typeof patch !== "object") return next;
 
-  // Admin allowed: limits, banner, subscription price/duration/dailyLimit (operational), feature flags (some), security (limited)
-  // Admin-only (super): walletPublic, points rules, commission rules, prompts, styles, rss sources/noiseFilters, security advanced
-  const ownerOnly = new Set([
-    "walletPublic",
-    "points",
-    "commission",
-    "prompts",
-    "styles",
-    "news"
-  ]);
+  // Admins can manage operational + prompt/style/news; owners share same access (admin is superset).
+  const ownerOnly = new Set([]);
 
   for (const key of Object.keys(patch)) {
     if (ownerOnly.has(key) && !isAdmin) continue;
@@ -545,7 +596,8 @@ function applyConfigPatchWithRBAC(env, role, cfg, patch) {
     if (key === "cache" && !isAdmin) continue;
     if (key === "payments" && !isAdmin) continue;
     if (key === "features" && !isAdmin) continue;
-    if (key === "security" && !isAdmin) continue; // security admin-only
+    if (key === "security" && !isOwner) continue;
+    if (key === "cache" && !isAdmin) continue;
 
     // Apply
     if (key === "walletPublic") next.walletPublic = String(patch.walletPublic || "").trim();
@@ -555,6 +607,7 @@ function applyConfigPatchWithRBAC(env, role, cfg, patch) {
     else if (key === "cache") next.cache = { ...next.cache, ...(patch.cache || {}) };
     else if (key === "payments") next.payments = { ...next.payments, ...(patch.payments || {}) };
     else if (key === "features") next.features = { ...next.features, ...(patch.features || {}) };
+    else if (key === "cache") next.cache = { ...next.cache, ...(patch.cache || {}) };
     else if (key === "security") next.security = { ...next.security, ...(patch.security || {}) };
     else if (key === "points") next.points = { ...next.points, ...(patch.points || {}) };
     else if (key === "commission") next.commission = { ...next.commission, ...(patch.commission || {}) };
@@ -574,7 +627,7 @@ function applyConfigPatchWithRBAC(env, role, cfg, patch) {
 
 async function rollbackConfig(env, actorId, verKey) {
   const role = roleOf(env, actorId);
-  if (!(role === "admin" || role === "owner")) return { ok: false, error: "admin_only" };
+  if (!(role === "owner" || role === "admin")) return { ok: false, error: "owner_only" };
 
   const snap = await kvGetJson(env, verKey);
   if (!snap) return { ok: false, error: "version_not_found" };
@@ -675,7 +728,7 @@ async function ensureUser(env, userId) {
   // Fix missing structures
   if (!u.moderation) u.moderation = { bannedUntil: 0, banReason: "", phoneDuplicate: false };
   if (!u.profile) u.profile = { onboardingDone: false, name: "", phone: "", experience: "", favoriteMarket: "", level: "" };
-  if (u.profile && !("level" in u.profile)) u.profile.level = "";
+  if (u.profile && typeof u.profile.level !== "string") u.profile.level = String(u.profile.level || "");
   if (!u.settings) u.settings = { tf: "H1", risk: "متوسط", style: "GENERAL", news: true };
   if (!u.quota) u.quota = { dayKey: utcDateKey(), dayUsed: 0, monthKey: utcMonthKey(), monthUsed: 0 };
   if (!u.referral) u.referral = { code: randomToken(8), referredBy: "", invites: 0, successfulInvites: 0, points: 0, commissionPct: 0 };
@@ -884,7 +937,7 @@ function mainMenuKeyboard() {
       [{ text: "👤 پروفایل" }, { text: "💳 خرید اشتراک" }],
       [{ text: "🎁 رفرال" }, { text: "🧠 تعیین سطح" }],
       [{ text: "🆘 پشتیبانی" }, { text: "📚 آموزش" }],
-      [{ text: "🧩 Mini App" }]
+      [{ text: "🧩 مینی‌اپ" }]
     ],
     resize_keyboard: true,
     is_persistent: true
@@ -961,6 +1014,11 @@ function levelResultInline() {
     ]
   };
 }
+function supportFaqInline() {
+  const rows = SUPPORT_FAQ.map((f) => [{ text: f.q, callback_data: `support:faq:${f.id}` }]);
+  rows.push([{ text: "✍️ ارسال تیکت جدید", callback_data: "support:new" }]);
+  return { inline_keyboard: rows };
+}
 
 // Mapping ReplyKeyboard button text -> command
 function mapButtonToCommand(text) {
@@ -974,7 +1032,7 @@ function mapButtonToCommand(text) {
     "🧠 تعیین سطح": "/level",
     "🆘 پشتیبانی": "/support",
     "📚 آموزش": "/education",
-    "🧩 Mini App": "/miniapp",
+    "🧩 مینی‌اپ": "/miniapp",
     "⬅️ منو": "/menu"
   };
   return m[t] || "";
@@ -1070,89 +1128,42 @@ function validTxid(txid) {
   const t = String(txid || "").trim();
   return /^[a-fA-F0-9]{12,120}$/.test(t);
 }
+function normalizeEvmAddress(addr) {
+  return String(addr || "").trim().toLowerCase();
+}
 async function publicWallet(env, cfg) {
   const w = String(cfg.walletPublic || "").trim();
   if (w) return w;
   return String(env.BOT_PUBLIC_WALLET || "").trim();
 }
-async function verifyPaymentOnChain(env, cfg, txid, expectedAmount) {
+async function verifyBep20Payment(env, cfg, txid) {
   const wallet = await publicWallet(env, cfg);
-  if (!wallet || !isValidBep20Address(wallet)) {
-    return { status: "invalid_wallet", reason: "public_wallet_invalid" };
-  }
-  if (!cfg.payments?.autoVerify) return { status: "skipped", reason: "auto_verify_off" };
+  if (!isValidEvmAddress(wallet)) return { ok: false, error: "wallet_invalid" };
 
-  const keys = collectApiKeys(env.BSCSCAN_API_KEY, env.BSCSCAN_API_KEYS);
-  if (!keys.length) return { status: "unknown", reason: "no_bscscan_key" };
+  const keys = splitKeys(env.BSCSCAN_API_KEY);
+  if (!keys.length) return { ok: false, error: "no_bscscan_key" };
 
-  const walletNorm = wallet.toLowerCase();
-  const contractNorm = String(cfg.payments.usdtContractBep20 || "").toLowerCase();
-  const minConfs = safeParseInt(cfg.payments.minConfirmations, 0);
-  const tolerance = clamp(safeParseInt(cfg.payments.priceTolerancePct, 0), 0, 50);
-  let lastErr = "not_found";
-
+  const contract = normalizeEvmAddress(env.USDT_BEP20_CONTRACT || "0x55d398326f99059ff775485246999027b3197955");
   for (const key of keys) {
-    try {
-      const url =
-        "https://api.bscscan.com/api?module=account&action=tokentx" +
-        `&address=${encodeURIComponent(wallet)}` +
-        `&page=1&offset=50&sort=desc&apikey=${encodeURIComponent(key)}`;
-      const res = await fetchWithTimeout(url, { method: "GET" }, 10000);
-      const json = await safeJson(res);
-      if (!res.ok || json?.status === "0") {
-        lastErr = json?.message || "bscscan_error";
-        if (res.status >= 500 || res.status === 429) continue;
-        return { status: "unknown", reason: lastErr };
-      }
-
-      const list = Array.isArray(json?.result) ? json.result : [];
-      const match = list.find((tx) => String(tx.hash || "").toLowerCase() === String(txid || "").toLowerCase());
-      if (!match) {
-        lastErr = "tx_not_found";
-        continue;
-      }
-
-      const toAddr = String(match.to || "").toLowerCase();
-      const fromAddr = String(match.from || "").toLowerCase();
-      const contractAddr = String(match.contractAddress || "").toLowerCase();
-      const symbol = String(match.tokenSymbol || "").toUpperCase();
-      const decimals = safeParseInt(match.tokenDecimal, 18);
-      const amount = Number(match.value || 0) / Math.pow(10, decimals);
-      const confirmations = safeParseInt(match.confirmations, 0);
-
-      if (contractNorm && contractAddr && contractAddr !== contractNorm) {
-        return { status: "mismatch", reason: "wrong_contract", amount, to: toAddr, from: fromAddr, confirmations, tokenSymbol: symbol };
-      }
-      if (toAddr !== walletNorm) {
-        return { status: "mismatch", reason: "wrong_to", amount, to: toAddr, from: fromAddr, confirmations, tokenSymbol: symbol };
-      }
-      if (minConfs && confirmations < minConfs) {
-        return { status: "pending", reason: "low_confirmations", amount, to: toAddr, confirmations, tokenSymbol: symbol };
-      }
-      const minAmount = Number(expectedAmount || 0) * (1 - tolerance / 100);
-      if (expectedAmount && amount + 1e-9 < minAmount) {
-        return { status: "mismatch", reason: "amount_low", amount, to: toAddr, confirmations, tokenSymbol: symbol };
-      }
-
-      return { status: "verified", amount, to: toAddr, from: fromAddr, confirmations, tokenSymbol: symbol };
-    } catch (e) {
-      lastErr = String(e?.message || e);
-      continue;
-    }
+    const url =
+      "https://api.bscscan.com/api?module=account&action=tokentx" +
+      `&txhash=${encodeURIComponent(txid)}` +
+      `&apikey=${encodeURIComponent(key)}`;
+    const res = await fetchWithTimeout(url, { method: "GET" }, 8000);
+    if (!res.ok) continue;
+    const j = await safeJson(res);
+    const list = Array.isArray(j?.result) ? j.result : [];
+    if (!list.length) continue;
+    const hit = list.find((r) => normalizeEvmAddress(r?.contractAddress) === contract);
+    if (!hit) continue;
+    const to = normalizeEvmAddress(hit?.to);
+    const decimals = safeParseInt(hit?.tokenDecimal, 18);
+    const amountRaw = Number(hit?.value || 0);
+    const amount = Number.isFinite(amountRaw) ? amountRaw / Math.pow(10, decimals) : 0;
+    const ok = to === normalizeEvmAddress(wallet);
+    return { ok: true, match: ok, amount, to, contract };
   }
-  return { status: "unknown", reason: lastErr };
-}
-function formatVerifySummary(verify) {
-  if (!verify) return "نامشخص";
-  const status = String(verify.status || "unknown");
-  const amount = verify.amount ? `، مبلغ: ${Number(verify.amount).toFixed(2)}` : "";
-  const conf = verify.confirmations ? `، کانفرم: ${verify.confirmations}` : "";
-  const reason = verify.reason ? `، دلیل: ${verify.reason}` : "";
-  if (status === "verified") return `✅ تایید شد${amount}${conf}`;
-  if (status === "pending") return `⏳ در انتظار کانفرم${amount}${conf}${reason}`;
-  if (status === "mismatch") return `⚠️ عدم تطابق${amount}${conf}${reason}`;
-  if (status === "invalid_wallet") return "❌ ولت عمومی نامعتبر";
-  return `❔ نامشخص${reason ? ` (${verify.reason})` : ""}`;
+  return { ok: false, error: "bscscan_unavailable" };
 }
 async function registerTx(env, cfg, userId, txid) {
   const t = String(txid || "").trim();
@@ -1176,8 +1187,29 @@ async function registerTx(env, cfg, userId, txid) {
     durationDays: cfg.subscription.durationDays,
     subDailyLimit: cfg.subscription.dailyLimit,
     note: "",
-    verify: { status: "pending", checkedAt: 0 }
+    verify: {
+      checked: false,
+      ok: false,
+      match: false,
+      amount: 0,
+      wallet: "",
+      error: ""
+    }
   };
+
+  try {
+    const verify = await verifyBep20Payment(env, cfg, t);
+    record.verify.checked = true;
+    record.verify.ok = !!verify.ok;
+    record.verify.match = !!verify.match;
+    record.verify.amount = Number(verify.amount || 0);
+    record.verify.wallet = await publicWallet(env, cfg);
+    record.verify.error = verify.ok ? "" : String(verify.error || "verify_failed");
+  } catch (e) {
+    record.verify.checked = true;
+    record.verify.ok = false;
+    record.verify.error = String(e?.message || e);
+  }
 
   await kvPutJson(env, kPayment(t), record);
   await kvPutText(env, kPayIdx("pending", createdAt, t), "1", { expirationTtl: 60 * 24 * 3600 });
@@ -1284,6 +1316,34 @@ async function expireOldPendingPayments(env, cfg) {
       await metricInc(env, "paymentsExpired", 1);
     }
   }
+}
+
+async function handlePaymentWebhook(request, env, cfg) {
+  const secret = String(env.PAYMENT_WEBHOOK_SECRET || "").trim();
+  if (secret) {
+    const got = request.headers.get("x-payment-secret") || "";
+    if (got !== secret) return jsonResponse({ ok: false, error: "forbidden" }, 403);
+  }
+  const body = await request.json().catch(() => ({}));
+  const txid = String(body.txid || "").trim();
+  if (!validTxid(txid)) return jsonResponse({ ok: false, error: "invalid_txid" }, 400);
+
+  const p = await kvGetJson(env, kPayment(txid));
+  if (!p) return jsonResponse({ ok: false, error: "payment_not_found" }, 404);
+
+  p.verify = p.verify || {};
+  p.verify.checked = true;
+  p.verify.ok = !!body.verified;
+  p.verify.match = !!body.verified;
+  p.verify.amount = Number(body.amount || p.verify.amount || 0);
+  p.verify.wallet = String(body.to || p.verify.wallet || "");
+  p.verify.error = String(body.error || "");
+  p.updatedAt = nowMs();
+
+  await kvPutJson(env, kPayment(txid), p);
+  await notifyStaff(env, `🔔 وبهوک پرداخت دریافت شد\nTXID: ${txid}\nVerified: ${p.verify.ok}\nAmount: ${p.verify.amount || "-"}\nWallet: ${p.verify.wallet || "-"}`);
+
+  return jsonResponse({ ok: true });
 }
 
 // ========== Tickets ==========
@@ -1718,52 +1778,38 @@ function extractLastJsonObject(text) {
     return null;
   }
 }
-function aiTemperatureForPurpose(purpose) {
-  if (purpose === "analysis") return 0.1;
-  return 0.3;
-}
-function collectApiKeys(primary, fallbackList) {
-  const out = [];
-  const add = (k) => {
-    const v = String(k || "").trim();
-    if (v && !out.includes(v)) out.push(v);
-  };
-  add(primary);
-  for (const k of parseList(fallbackList)) add(k);
-  return out;
-}
-async function callAI(env, cfg, purpose, messages, timeoutMs = 15000) {
-  const provider = String(env.AI_PROVIDER || "cloudflare").toLowerCase();
-  const temperature = aiTemperatureForPurpose(purpose);
-
-  // Circuit breaker per provider
+async function callAIWithProvider(env, provider, purpose, messages, timeoutMs) {
   const cbName = `ai:${provider}:${purpose}`;
   if (await circuitIsOpen(env, cbName)) return { ok: false, error: "ai_circuit_open" };
 
   // Cloudflare AI binding
   if (provider === "cloudflare") {
     if (!env.AI || !env.AI.run) return { ok: false, error: "Cloudflare AI binding not available" };
-    try {
-      const model = "@cf/meta/llama-3.1-8b-instruct";
-      const prompt = messages.map((m) => `${m.role.toUpperCase()}: ${m.content}`).join("\n\n");
-      const p = env.AI.run(model, { prompt, max_tokens: 1400 });
-      const out = await promiseWithTimeout(p, timeoutMs, "ai_timeout");
-      const text = out?.response || out?.output_text || JSON.stringify(out);
-      await circuitReport(env, cbName, true);
-      return { ok: true, text: String(text || "") };
-    } catch (e) {
-      console.error("CF AI error", e);
-      await circuitReport(env, cbName, false);
-      return { ok: false, error: String(e?.message || e) };
+    const models = splitKeys(env.CLOUDFLARE_AI_MODELS);
+    const list = models.length ? models : ["@cf/meta/llama-3.1-8b-instruct"];
+    const prompt = messages.map((m) => `${m.role.toUpperCase()}: ${m.content}`).join("\n\n");
+    for (const model of list) {
+      try {
+        const p = env.AI.run(model, { prompt, max_tokens: 1400 });
+        const out = await promiseWithTimeout(p, timeoutMs, "ai_timeout");
+        const text = out?.response || out?.output_text || JSON.stringify(out);
+        if (text) {
+          await circuitReport(env, cbName, true);
+          return { ok: true, text: String(text || "") };
+        }
+      } catch (e) {
+        console.error("CF AI error", e);
+      }
     }
+    await circuitReport(env, cbName, false);
+    return { ok: false, error: "cloudflare_error" };
   }
 
   // OpenAI
   if (provider === "openai") {
-    const keys = collectApiKeys(env.OPENAI_API_KEY, env.OPENAI_API_KEYS);
+    const keys = splitKeys(env.OPENAI_API_KEY);
     const model = String(env.OPENAI_MODEL || "gpt-4o-mini").trim();
     if (!keys.length) return { ok: false, error: "OPENAI_API_KEY missing" };
-    let lastErr = "openai_error";
     for (const key of keys) {
       try {
         const res = await fetchWithTimeout(
@@ -1771,102 +1817,93 @@ async function callAI(env, cfg, purpose, messages, timeoutMs = 15000) {
           {
             method: "POST",
             headers: { "content-type": "application/json", authorization: `Bearer ${key}` },
-            body: JSON.stringify({ model, messages, temperature })
+            body: JSON.stringify({ model, messages, temperature: 0.3 })
           },
           timeoutMs
         );
         const j = await safeJson(res);
         const text = j?.choices?.[0]?.message?.content || "";
-        if (!res.ok) {
-          lastErr = j?.error?.message || "openai_error";
-          if (res.status >= 500 || res.status === 429) continue;
-          throw new Error(lastErr);
+        if (text) {
+          await circuitReport(env, cbName, true);
+          return { ok: true, text: String(text || "") };
         }
-        await circuitReport(env, cbName, true);
-        return { ok: true, text: String(text || "") };
       } catch (e) {
-        lastErr = String(e?.message || e);
-        continue;
+        console.error("OpenAI error", e);
       }
     }
-    console.error("OpenAI error", lastErr);
     await circuitReport(env, cbName, false);
-    return { ok: false, error: lastErr };
+    return { ok: false, error: "openai_error" };
   }
 
   // Gemini
   if (provider === "gemini") {
-    const keys = collectApiKeys(env.GEMINI_API_KEY, env.GEMINI_API_KEYS);
+    const keys = splitKeys(env.GEMINI_API_KEY);
     const model = String(env.GEMINI_MODEL || "gemini-1.5-flash").trim();
     if (!keys.length) return { ok: false, error: "GEMINI_API_KEY missing" };
-    let lastErr = "gemini_error";
+    const contents = messages.map((m) => ({ role: m.role === "assistant" ? "model" : "user", parts: [{ text: m.content }] }));
     for (const key of keys) {
       try {
         const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(key)}`;
-        const contents = messages.map((m) => ({ role: m.role === "assistant" ? "model" : "user", parts: [{ text: m.content }] }));
-        const res = await fetchWithTimeout(
-          url,
-          { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ contents, generationConfig: { temperature } }) },
-          timeoutMs
-        );
+        const res = await fetchWithTimeout(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ contents }) }, timeoutMs);
         const j = await safeJson(res);
         const text = j?.candidates?.[0]?.content?.parts?.map((p) => p.text).join("\n") || "";
-        if (!res.ok) {
-          lastErr = j?.error?.message || "gemini_error";
-          if (res.status >= 500 || res.status === 429) continue;
-          throw new Error(lastErr);
+        if (text) {
+          await circuitReport(env, cbName, true);
+          return { ok: true, text: String(text || "") };
         }
-        await circuitReport(env, cbName, true);
-        return { ok: true, text: String(text || "") };
       } catch (e) {
-        lastErr = String(e?.message || e);
-        continue;
+        console.error("Gemini error", e);
       }
     }
-    console.error("Gemini error", lastErr);
     await circuitReport(env, cbName, false);
-    return { ok: false, error: lastErr };
+    return { ok: false, error: "gemini_error" };
   }
 
   // Compat (OpenAI-compatible)
   if (provider === "compat") {
     const base = String(env.AI_COMPAT_BASE_URL || "").trim();
-    const keys = collectApiKeys(env.AI_COMPAT_API_KEY, env.AI_COMPAT_API_KEYS);
+    const keys = splitKeys(env.AI_COMPAT_API_KEY);
     const model = String(env.AI_COMPAT_MODEL || "").trim();
     if (!base || !keys.length || !model) return { ok: false, error: "AI_COMPAT_* missing" };
-    let lastErr = "compat_error";
+    const url = base.replace(/\/+$/, "") + "/chat/completions";
     for (const key of keys) {
       try {
-        const url = base.replace(/\/+$/, "") + "/chat/completions";
         const res = await fetchWithTimeout(
           url,
           {
             method: "POST",
             headers: { "content-type": "application/json", authorization: `Bearer ${key}` },
-            body: JSON.stringify({ model, messages, temperature })
+            body: JSON.stringify({ model, messages, temperature: 0.3 })
           },
           timeoutMs
         );
         const j = await safeJson(res);
         const text = j?.choices?.[0]?.message?.content || "";
-        if (!res.ok) {
-          lastErr = j?.error?.message || "compat_error";
-          if (res.status >= 500 || res.status === 429) continue;
-          throw new Error(lastErr);
+        if (text) {
+          await circuitReport(env, cbName, true);
+          return { ok: true, text: String(text || "") };
         }
-        await circuitReport(env, cbName, true);
-        return { ok: true, text: String(text || "") };
       } catch (e) {
-        lastErr = String(e?.message || e);
-        continue;
+        console.error("Compat error", e);
       }
     }
-    console.error("Compat error", lastErr);
     await circuitReport(env, cbName, false);
-    return { ok: false, error: lastErr };
+    return { ok: false, error: "compat_error" };
   }
 
   return { ok: false, error: "Unknown AI_PROVIDER" };
+}
+
+async function callAI(env, cfg, purpose, messages, timeoutMs = 15000) {
+  const providers = splitKeys(env.AI_PROVIDER || "cloudflare").map((p) => p.toLowerCase());
+  const list = providers.length ? providers : ["cloudflare"];
+  let lastErr = "ai_error";
+  for (const provider of list) {
+    const r = await callAIWithProvider(env, provider, purpose, messages, timeoutMs);
+    if (r.ok) return r;
+    lastErr = r.error || lastErr;
+  }
+  return { ok: false, error: lastErr };
 }
 
 // ========== Zones schema ==========
@@ -1972,75 +2009,83 @@ async function fetchCandlesYahoo(symbol, range = "10d", interval = "1h") {
   return out;
 }
 async function fetchCandlesTwelveData(env, symbol, interval, outputsize) {
-  const key = String(env.TWELVEDATA_API_KEY || "").trim();
-  if (!key) throw new Error("no_twelvedata_key");
-  const url = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(interval)}&outputsize=${outputsize}&apikey=${encodeURIComponent(key)}`;
-  const res = await fetchWithTimeout(url, { method: "GET" }, 8000);
-  if (!res.ok) throw new Error("twelvedata_bad");
-  const j = await safeJson(res);
-  const values = j?.values;
-  if (!Array.isArray(values)) throw new Error("twelvedata_parse");
-  const out = values
-    .map((v) => {
-      const t = Date.parse(v.datetime || v.datetime_utc || "");
-      return { t, o: Number(v.open), h: Number(v.high), l: Number(v.low), c: Number(v.close) };
-    })
-    .filter((x) => [x.t, x.o, x.h, x.l, x.c].every(Number.isFinite));
-  out.reverse();
-  if (!out.length) throw new Error("twelvedata_empty");
-  return out;
+  const keys = splitKeys(env.TWELVEDATA_API_KEY);
+  if (!keys.length) throw new Error("no_twelvedata_key");
+  for (const key of keys) {
+    const url = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(interval)}&outputsize=${outputsize}&apikey=${encodeURIComponent(key)}`;
+    const res = await fetchWithTimeout(url, { method: "GET" }, 8000);
+    if (!res.ok) continue;
+    const j = await safeJson(res);
+    const values = j?.values;
+    if (!Array.isArray(values)) continue;
+    const out = values
+      .map((v) => {
+        const t = Date.parse(v.datetime || v.datetime_utc || "");
+        return { t, o: Number(v.open), h: Number(v.high), l: Number(v.low), c: Number(v.close) };
+      })
+      .filter((x) => [x.t, x.o, x.h, x.l, x.c].every(Number.isFinite));
+    out.reverse();
+    if (out.length) return out;
+  }
+  throw new Error("twelvedata_empty");
 }
 async function fetchCandlesFinnhub(env, symbol, resolution, fromSec, toSec) {
-  const key = String(env.FINNHUB_API_KEY || "").trim();
-  if (!key) throw new Error("no_finnhub_key");
-  const url = `https://finnhub.io/api/v1/stock/candle?symbol=${encodeURIComponent(symbol)}&resolution=${encodeURIComponent(resolution)}&from=${fromSec}&to=${toSec}&token=${encodeURIComponent(key)}`;
-  const res = await fetchWithTimeout(url, { method: "GET" }, 8000);
-  if (!res.ok) throw new Error("finnhub_bad");
-  const j = await safeJson(res);
-  if (j?.s !== "ok") throw new Error("finnhub_notok");
-  const out = [];
-  for (let i = 0; i < (j.t || []).length; i++) {
-    const t = Number(j.t[i]) * 1000;
-    const o = Number(j.o[i]), h = Number(j.h[i]), l = Number(j.l[i]), c = Number(j.c[i]);
-    if ([t, o, h, l, c].every(Number.isFinite)) out.push({ t, o, h, l, c });
+  const keys = splitKeys(env.FINNHUB_API_KEY);
+  if (!keys.length) throw new Error("no_finnhub_key");
+  for (const key of keys) {
+    const url = `https://finnhub.io/api/v1/stock/candle?symbol=${encodeURIComponent(symbol)}&resolution=${encodeURIComponent(resolution)}&from=${fromSec}&to=${toSec}&token=${encodeURIComponent(key)}`;
+    const res = await fetchWithTimeout(url, { method: "GET" }, 8000);
+    if (!res.ok) continue;
+    const j = await safeJson(res);
+    if (j?.s !== "ok") continue;
+    const out = [];
+    for (let i = 0; i < (j.t || []).length; i++) {
+      const t = Number(j.t[i]) * 1000;
+      const o = Number(j.o[i]), h = Number(j.h[i]), l = Number(j.l[i]), c = Number(j.c[i]);
+      if ([t, o, h, l, c].every(Number.isFinite)) out.push({ t, o, h, l, c });
+    }
+    if (out.length) return out;
   }
-  if (!out.length) throw new Error("finnhub_empty");
-  return out;
+  throw new Error("finnhub_empty");
 }
 async function fetchCandlesAlphaVantage(env, symbol, interval) {
-  const key = String(env.ALPHAVANTAGE_API_KEY || "").trim();
-  if (!key) throw new Error("no_av_key");
-  const url = `https://www.alphavantage.co/query?function=TIME_SERIES_INTRADAY&symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(interval)}&apikey=${encodeURIComponent(key)}&outputsize=compact`;
-  const res = await fetchWithTimeout(url, { method: "GET" }, 8000);
-  if (!res.ok) throw new Error("av_bad");
-  const j = await safeJson(res);
-  const seriesKey = Object.keys(j || {}).find((k) => k.toLowerCase().includes("time series"));
-  const series = seriesKey ? j[seriesKey] : null;
-  if (!series) throw new Error("av_parse");
-  const out = [];
-  for (const [dt, v] of Object.entries(series)) {
-    const t = Date.parse(dt);
-    const o = Number(v["1. open"]), h = Number(v["2. high"]), l = Number(v["3. low"]), c = Number(v["4. close"]);
-    if ([t, o, h, l, c].every(Number.isFinite)) out.push({ t, o, h, l, c });
+  const keys = splitKeys(env.ALPHAVANTAGE_API_KEY);
+  if (!keys.length) throw new Error("no_av_key");
+  for (const key of keys) {
+    const url = `https://www.alphavantage.co/query?function=TIME_SERIES_INTRADAY&symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(interval)}&apikey=${encodeURIComponent(key)}&outputsize=compact`;
+    const res = await fetchWithTimeout(url, { method: "GET" }, 8000);
+    if (!res.ok) continue;
+    const j = await safeJson(res);
+    const seriesKey = Object.keys(j || {}).find((k) => k.toLowerCase().includes("time series"));
+    const series = seriesKey ? j[seriesKey] : null;
+    if (!series) continue;
+    const out = [];
+    for (const [dt, v] of Object.entries(series)) {
+      const t = Date.parse(dt);
+      const o = Number(v["1. open"]), h = Number(v["2. high"]), l = Number(v["3. low"]), c = Number(v["4. close"]);
+      if ([t, o, h, l, c].every(Number.isFinite)) out.push({ t, o, h, l, c });
+    }
+    out.sort((a, b) => a.t - b.t);
+    if (out.length) return out;
   }
-  out.sort((a, b) => a.t - b.t);
-  if (!out.length) throw new Error("av_empty");
-  return out;
+  throw new Error("av_empty");
 }
 async function fetchCandlesPolygon(env, symbol, fromDate, toDate) {
-  const key = String(env.POLYGON_API_KEY || "").trim();
-  if (!key) throw new Error("no_polygon_key");
-  const url = `https://api.polygon.io/v2/aggs/ticker/${encodeURIComponent(symbol)}/range/1/hour/${encodeURIComponent(fromDate)}/${encodeURIComponent(toDate)}?adjusted=true&sort=asc&limit=50000&apiKey=${encodeURIComponent(key)}`;
-  const res = await fetchWithTimeout(url, { method: "GET" }, 8000);
-  if (!res.ok) throw new Error("polygon_bad");
-  const j = await safeJson(res);
-  const arr = j?.results || [];
-  if (!Array.isArray(arr)) throw new Error("polygon_parse");
-  const out = arr
-    .map((r) => ({ t: Number(r.t), o: Number(r.o), h: Number(r.h), l: Number(r.l), c: Number(r.c) }))
-    .filter((x) => [x.t, x.o, x.h, x.l, x.c].every(Number.isFinite));
-  if (!out.length) throw new Error("polygon_empty");
-  return out;
+  const keys = splitKeys(env.POLYGON_API_KEY);
+  if (!keys.length) throw new Error("no_polygon_key");
+  for (const key of keys) {
+    const url = `https://api.polygon.io/v2/aggs/ticker/${encodeURIComponent(symbol)}/range/1/hour/${encodeURIComponent(fromDate)}/${encodeURIComponent(toDate)}?adjusted=true&sort=asc&limit=50000&apiKey=${encodeURIComponent(key)}`;
+    const res = await fetchWithTimeout(url, { method: "GET" }, 8000);
+    if (!res.ok) continue;
+    const j = await safeJson(res);
+    const arr = j?.results || [];
+    if (!Array.isArray(arr)) continue;
+    const out = arr
+      .map((r) => ({ t: Number(r.t), o: Number(r.o), h: Number(r.h), l: Number(r.l), c: Number(r.c) }))
+      .filter((x) => [x.t, x.o, x.h, x.l, x.c].every(Number.isFinite));
+    if (out.length) return out;
+  }
+  throw new Error("polygon_empty");
 }
 function snapshotFromCandles(candles) {
   const last = candles[candles.length - 1];
@@ -2154,11 +2199,10 @@ function buildChartUrl(cfg, symbol, tf, candles, zones) {
         {
           label: `${symbol} (${tf})`,
           data,
-          borderColor: "#8ecbff",
           color: {
-            up: "#33d17a",
-            down: "#ff6b6b",
-            unchanged: "#999999"
+            up: "rgba(0,200,0,.9)",
+            down: "rgba(200,0,0,.9)",
+            unchanged: "rgba(200,200,200,.7)"
           }
         }
       ]
@@ -2194,6 +2238,9 @@ function buildAnalysisPrompt(cfg, user, market, symbol, tf, snap, newsBundle) {
   const level = user.profile?.level || user.profile?.experience || "نامشخص";
   const styleName = String(user.settings.style || "GENERAL").toUpperCase();
   const newsOn = !!user.settings.news && !!cfg.features.newsEnabled;
+  const level = user.profile?.level || "unknown";
+  const styleKey = String(user.settings.style || "GENERAL").toUpperCase();
+  const styleName = styleLabel(cfg, styleKey);
 
   let newsText = "";
   if (newsOn && newsBundle?.items?.length) {
@@ -2203,15 +2250,48 @@ function buildAnalysisPrompt(cfg, user, market, symbol, tf, snap, newsBundle) {
 
   return (
     `${base}\n\n` +
-    `پرامپت سبک (${styleName}):\n${styleP}\n\n` +
-    `اطلاعات زمینه‌ای:\n` +
-    `بازار: ${market}\nنماد: ${symbol}\nتایم‌فریم: ${tf}\nسطح کاربر: ${level}\nریسک‌پذیری: ${risk}\n` +
-    `داده لحظه‌ای: lastClose=${snap.lastClose}, changePct=${snap.changePct.toFixed(2)}%, rangeHi=${snap.rangeHi}, rangeLo=${snap.rangeLo}\n` +
+    `دستور سبک انتخابی (${styleName}):\n${styleP}\n\n` +
+    `Market: ${market}\nSymbol: ${symbol}\nTimeframe: ${tf}\nRisk: ${risk}\nUserLevel: ${level}\nStyle: ${styleKey}\n` +
+    `Snapshot: lastClose=${snap.lastClose}, changePct=${snap.changePct.toFixed(2)}%, rangeHi=${snap.rangeHi}, rangeLo=${snap.rangeLo}\n` +
     `${newsText}\n` +
     "خروجی باید فقط فارسی و ساختارمند باشد:\n" +
     "1) خلاصه سریع\n2) بایاس و ساختار\n3) سطوح کلیدی\n4) سناریوها (اصلی/جایگزین)\n5) مدیریت ریسک و ابطال\n6) پلن کوتاه\n" +
     ZONES_SCHEMA_HINT
   );
+}
+async function analysisCacheKey(prompt) {
+  return await sha256Hex(prompt);
+}
+async function analyzeWithCache(env, cfg, user, market, symbol, tf, snap, newsBundle) {
+  const prompt = buildAnalysisPrompt(cfg, user, market, symbol, tf, snap, newsBundle);
+  const key = await analysisCacheKey(prompt);
+  const ttl = cfg.cache?.analysisTtlMs || 180000;
+  const cached = await getAnalysisCache(env, key, ttl);
+  if (cached?.payload) {
+    return { ok: true, fromCache: true, prompt, ...cached.payload };
+  }
+
+  const ai = await callAI(env, cfg, "analysis", [{ role: "user", content: prompt }], 20000);
+  let analysisText = "";
+  let zones = [];
+  if (ai.ok) {
+    analysisText = String(ai.text || "");
+    let zonesObj = extractLastJsonObject(analysisText);
+    let val = validateZones(zonesObj);
+    if (!val.ok) {
+      const repaired = await repairZonesJsonOnce(env, cfg, analysisText);
+      val = validateZones(repaired);
+    }
+    zones = val.ok ? val.zones : [];
+    if (zonesObj) {
+      const idx = analysisText.lastIndexOf("{");
+      if (idx > 0) analysisText = analysisText.slice(0, idx).trim();
+    }
+    await setAnalysisCache(env, key, { text: analysisText, zones }, ttl);
+    return { ok: true, fromCache: false, prompt, text: analysisText, zones };
+  }
+
+  return { ok: false, error: ai.error || "ai_error", prompt };
 }
 
 async function parseAnalysisZones(env, cfg, analysisText) {
@@ -2250,21 +2330,23 @@ const LEVEL_QUESTIONS = [
   { id: "q3", q: "در مدیریت ریسک، معمولا چقدر ریسک می‌کنی؟ (کم/متوسط/زیاد)" },
   { id: "q4", q: "هدف اصلی‌ات چیست؟ (اسکالپ/سوئینگ/بلندمدت)" }
 ];
-const SUPPORT_PRESET_QUESTIONS = [
-  "مشکل پرداخت دارم",
-  "مشکل در دریافت تحلیل",
-  "مشکل در دسترسی به اشتراک",
-  "سوال درباره کیف پول/برداشت",
-  "مشکل تایید TXID"
-];
-function supportPresetKeyboard() {
-  const rows = [];
-  for (let i = 0; i < SUPPORT_PRESET_QUESTIONS.length; i += 2) {
-    rows.push(SUPPORT_PRESET_QUESTIONS.slice(i, i + 2).map((t) => ({ text: t })));
+const SUPPORT_FAQ = [
+  {
+    id: "payment",
+    q: "پرداخت/تایید تراکنش",
+    a: "بعد از پرداخت USDT (BEP20)، TXID را با /tx ارسال کن. تایید نهایی توسط ادمین انجام می‌شود."
+  },
+  {
+    id: "miniapp",
+    q: "ورود به مینی‌اپ",
+    a: "از داخل تلگرام وارد مینی‌اپ شو تا initData معتبر ارسال شود. در غیر این صورت احراز هویت انجام نمی‌شود."
+  },
+  {
+    id: "quota",
+    q: "سهمیه تحلیل",
+    a: "پلن رایگان: روزانه 3 بار و ماهانه 100 بار. با اشتراک محدودیت روزانه بیشتر می‌شود."
   }
-  rows.push([{ text: "✍️ متن دلخواه" }], [{ text: "⬅️ منو" }]);
-  return { keyboard: rows, resize_keyboard: true, is_persistent: true };
-}
+];
 async function evaluateLevelWithAI(env, cfg, answers) {
   const content =
     "با توجه به پاسخ‌های زیر سطح کاربر را تعیین کن و خروجی را به صورت JSON بده.\n" +
@@ -2325,7 +2407,7 @@ async function hmacSha256(keyBytes, msgBytes) {
   const sig = await crypto.subtle.sign("HMAC", key, msgBytes);
   return new Uint8Array(sig);
 }
-async function verifyTelegramInitData(initData, botToken, maxAgeSec = 24 * 3600) {
+async function verifyTelegramInitData(initData, botToken, maxAgeSec = 7 * 24 * 3600) {
   try {
     const params = new URLSearchParams(initData);
     const hash = params.get("hash");
@@ -2369,7 +2451,6 @@ async function authFromRequest(request, env, cfg) {
     request.headers.get("x-telegram-init-data") ||
     request.headers.get("x-init-data") ||
     url.searchParams.get("initData") ||
-    url.searchParams.get("tgInitData") ||
     "";
   const botToken = String(env.BOT_TOKEN || "").trim();
   if (!initData || !botToken) return { ok: false, error: "no_init_data" };
@@ -2469,7 +2550,14 @@ hr{border:none;border-top:1px solid rgba(255,255,255,.10);margin:10px 0}
     <div class="row">
       <select id="tf"><option>M15</option><option>M30</option><option>H1</option><option>H4</option><option>D1</option></select>
       <select id="risk"><option>کم</option><option>متوسط</option><option>زیاد</option></select>
-      <select id="style"><option>RTM</option><option>ICT</option><option>PRICE_ACTION</option><option>GENERAL</option><option>METHOD</option><option>CUSTOM</option></select>
+      <select id="style">
+        <option value="RTM">RTM</option>
+        <option value="ICT">ICT</option>
+        <option value="PRICE_ACTION">پرایس اکشن</option>
+        <option value="GENERAL">تحلیل عمومی</option>
+        <option value="METHOD">متد</option>
+        <option value="CUSTOM">پرامپت اختصاصی</option>
+      </select>
       <label class="small"><input type="checkbox" id="newsToggle"/> اخبار</label>
     </div>
     <div style="margin-top:10px" class="row">
@@ -2528,7 +2616,7 @@ hr{border:none;border-top:1px solid rgba(255,255,255,.10);margin:10px 0}
   async function refresh(){
     status.textContent = "در حال بارگذاری...";
     const prof = await api("/api/profile");
-    if(!prof.ok){ status.textContent="خطای احراز هویت"; document.getElementById("result").innerHTML="<pre>"+JSON.stringify(prof,null,2)+"</pre>"; return; }
+    if(!prof.ok){ status.textContent="خطای احراز"; document.getElementById("result").innerHTML="<pre>"+JSON.stringify(prof,null,2)+"</pre>"; return; }
 
     document.getElementById("name").textContent = prof.profile.name || ("کاربر " + prof.id);
     document.getElementById("role").textContent = prof.role;
@@ -2551,13 +2639,12 @@ hr{border:none;border-top:1px solid rgba(255,255,255,.10);margin:10px 0}
     const b = document.getElementById("banner");
     if(banner && banner.enabled){
       b.style.display = "block";
-      let html = "";
-      if(banner.imageUrl){
-        const link = banner.link || "#";
-        html += "<a href='"+link+"' target='_blank'><img src='"+banner.imageUrl+"' alt='banner' style='width:100%;border-radius:12px;border:1px solid rgba(255,255,255,.12);margin-bottom:8px'/></a>";
+      let html = "<b>🎁 "+banner.text+"</b>";
+      if(banner.imageKey){
+        const src = "/banner?key=" + encodeURIComponent(banner.imageKey);
+        html += "<div style='margin-top:8px'><img alt='banner' style='width:100%;border-radius:12px;border:1px solid rgba(255,255,255,.15)' src='"+src+"'/></div>";
       }
-      html += "<b>🎁 "+(banner.text || "")+"</b>";
-      if(banner.link) html += "<div class='small'><a href='"+banner.link+"' target='_blank'>"+banner.link+"</a></div>";
+      if(banner.link){ html += "<div class='small'><a href='"+banner.link+"' target='_blank'>"+banner.link+"</a></div>"; }
       b.innerHTML = html;
     } else b.style.display = "none";
 
@@ -2584,7 +2671,7 @@ hr{border:none;border-top:1px solid rgba(255,255,255,.10);margin:10px 0}
     const symbol = document.getElementById("symbol").value.trim();
     const r = await api("/api/signals", {market, symbol});
     let html = "<pre>"+(r.text || JSON.stringify(r,null,2))+"</pre>";
-    if(r.chartUrl) html += "<hr/><div><a href='"+r.chartUrl+"' target='_blank'>باز کردن چارت</a></div><img style='width:100%;margin-top:8px;border-radius:12px;border:1px solid rgba(255,255,255,.15)' src='"+r.chartUrl+"'/>";
+    if(r.chartUrl) html += "<hr/><div><a href='"+r.chartUrl+"' target='_blank'>نمایش چارت</a></div><img style='width:100%;margin-top:8px;border-radius:12px;border:1px solid rgba(255,255,255,.15)' src='"+r.chartUrl+"'/>";
     document.getElementById("result").innerHTML = html;
     refresh();
   };
@@ -2636,7 +2723,7 @@ function adminHtml() {
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>پنل مدیریت Market IQ</title>
+<title>Market IQ پنل مدیریت</title>
 <style>
 :root{--bg:#0b1220;--card:rgba(255,255,255,.06);--border:rgba(255,255,255,.10);--txt:#e8eefc}
 *{box-sizing:border-box}
@@ -2664,7 +2751,7 @@ a{color:#9dd1ff}
   </div>
   <div class="row">
     <a class="btn" href="/" style="text-decoration:none">مینی‌اپ</a>
-    <button class="btn" id="login">🔑 توکن ادمین</button>
+    <button class="btn" id="login">🔑 توکن دسترسی</button>
     <span class="badge" id="role">-</span>
   </div>
 </header>
@@ -2679,18 +2766,18 @@ a{color:#9dd1ff}
       <button class="btn" id="payments">💳 پرداخت‌ها</button>
       <button class="btn" id="tickets">🆘 تیکت‌ها</button>
       <button class="btn" id="requests">📌 درخواست‌ها</button>
-      <button class="btn" id="audit">🧾 لاگ‌ها</button>
-      <button class="btn" id="broadcast">📣 پیام همگانی</button>
+      <button class="btn" id="audit">🧾 لاگ</button>
+      <button class="btn" id="broadcast">📣 ارسال همگانی</button>
     </div>
-    <div class="small">نکته: بعضی فیلدها فقط برای ادمین قابل تغییر هستند (Wallet/Prompts/Styles/Points/Commission/News/Security).</div>
+    <div class="small">نکته: برخی فیلدها ممکن است محدود باشند و در صورت نبود دسترسی نادیده گرفته می‌شوند.</div>
   </div>
 
   <div class="card">
-    <h3 style="margin:0 0 8px 0;font-size:14px">ویرایش تنظیمات</h3>
+    <h3 style="margin:0 0 8px 0;font-size:14px">ویرایشگر تنظیمات</h3>
 
     <div class="row">
       <div style="flex:1;min-width:240px">
-        <label class="small">ولت عمومی (فقط ادمین)</label>
+        <label class="small">ولت عمومی (Owner)</label>
         <input id="walletPublic" placeholder="0x..."/>
       </div>
       <div style="flex:1;min-width:160px">
@@ -2717,7 +2804,7 @@ a{color:#9dd1ff}
         <input id="freeMonthly" type="number"/>
       </div>
       <div style="flex:1;min-width:160px">
-        <label class="small">فعال بودن بنر</label>
+        <label class="small">فعال‌سازی بنر</label>
         <select id="bannerEnabled"><option value="true">true</option><option value="false">false</option></select>
       </div>
     </div>
@@ -2732,62 +2819,58 @@ a{color:#9dd1ff}
         <input id="bannerLink"/>
       </div>
       <div style="flex:1;min-width:240px">
-        <label class="small">کلید تصویر بنر در R2</label>
+        <label class="small">کلید تصویر بنر (R2)</label>
         <input id="bannerImageKey" placeholder="banners/top.png"/>
-      </div>
-      <div style="flex:1;min-width:240px">
-        <label class="small">آدرس تصویر بنر (اختیاری)</label>
-        <input id="bannerImageUrl" placeholder="https://..."/>
       </div>
     </div>
 
     <div style="margin-top:10px">
-      <label class="small">پرامپت پایه (پیشنهادی برای ادمین)</label>
+      <label class="small">پرامپت پایه (Owner)</label>
       <textarea id="basePrompt" rows="5"></textarea>
     </div>
 
     <div style="margin-top:10px">
-      <label class="small">پرامپت Vision (پیشنهادی برای ادمین)</label>
+      <label class="small">پرامپت Vision (Owner)</label>
       <textarea id="visionPrompt" rows="4"></textarea>
     </div>
 
     <div style="margin-top:10px">
-      <label class="small">پرامپت سبک‌ها (JSON، فقط ادمین)</label>
+      <label class="small">پرامپت‌های هر سبک (JSON)</label>
       <textarea id="perStyle" rows="6"></textarea>
     </div>
 
     <div style="margin-top:10px">
-      <label class="small">سبک‌ها (JSON، فقط ادمین)</label>
+      <label class="small">سبک‌ها (JSON)</label>
       <textarea id="stylesJson" rows="6"></textarea>
     </div>
 
     <div style="margin-top:10px">
-      <label class="small">اخبار (JSON، فقط ادمین) — rss/noiseFilters/ttlMs</label>
+      <label class="small">اخبار (JSON) — rss/noiseFilters/ttlMs</label>
       <textarea id="newsJson" rows="6"></textarea>
     </div>
 
     <div class="row" style="margin-top:10px">
       <div style="flex:1;min-width:160px">
-        <label class="small">امتیاز هر دعوت (فقط ادمین)</label>
+        <label class="small">امتیاز هر دعوت</label>
         <input id="pInvite" type="number"/>
       </div>
       <div style="flex:1;min-width:160px">
-        <label class="small">امتیاز لازم برای اشتراک رایگان (فقط ادمین)</label>
+        <label class="small">امتیاز تبدیل به اشتراک رایگان</label>
         <input id="pRedeem" type="number"/>
       </div>
       <div style="flex:1;min-width:160px">
-        <label class="small">امتیاز خرید اشتراک (فقط ادمین)</label>
+        <label class="small">امتیاز خرید اشتراک</label>
         <input id="pBuy" type="number"/>
       </div>
     </div>
 
     <div class="row" style="margin-top:10px">
       <div style="flex:1;min-width:160px">
-        <label class="small">گام کمیسیون % (فقط ادمین)</label>
+        <label class="small">گام کمیسیون (%)</label>
         <input id="cStep" type="number"/>
       </div>
       <div style="flex:1;min-width:160px">
-        <label class="small">حداکثر کمیسیون % (فقط ادمین)</label>
+        <label class="small">حداکثر کمیسیون (%)</label>
         <input id="cMax" type="number"/>
       </div>
     </div>
@@ -2798,14 +2881,18 @@ a{color:#9dd1ff}
         <textarea id="featuresJson" rows="3"></textarea>
       </div>
       <div style="flex:1;min-width:160px">
-        <label class="small">امنیت (JSON، فقط ادمین)</label>
+        <label class="small">کش تحلیل (JSON)</label>
+        <textarea id="cacheJson" rows="3"></textarea>
+      </div>
+      <div style="flex:1;min-width:160px">
+        <label class="small">امنیت (JSON)</label>
         <textarea id="securityJson" rows="3"></textarea>
       </div>
     </div>
 
     <div class="row" style="margin-top:10px">
       <div style="flex:1;min-width:160px">
-        <label class="small">بازگشت تنظیمات (فقط ادمین) — verKey</label>
+        <label class="small">بازگردانی تنظیمات — verKey</label>
         <input id="rollbackKey" placeholder="marketiq:config:ver:...."/>
       </div>
       <button class="btn" id="rollbackBtn">⟲ بازگشت</button>
@@ -2843,13 +2930,13 @@ a{color:#9dd1ff}
 
   async function whoami(){
     const r = await api("/api/admin/whoami");
-    roleBadge.textContent = r && r.ok ? r.role : "نامعتبر";
+    roleBadge.textContent = r && r.ok ? r.role : "عدم دسترسی";
   }
 
   async function loadCfg(){
     status.textContent="در حال بارگذاری...";
     const r = await api("/api/admin/config/get");
-    if(!r.ok){ status.textContent="خطای احراز هویت"; setOut(r); return; }
+    if(!r.ok){ status.textContent="خطای دسترسی"; setOut(r); return; }
     const c = r.cfg;
 
     document.getElementById("walletPublic").value = c.walletPublic || "";
@@ -2864,7 +2951,6 @@ a{color:#9dd1ff}
     document.getElementById("bannerText").value = c.banner.text || "";
     document.getElementById("bannerLink").value = c.banner.link || "";
     document.getElementById("bannerImageKey").value = c.banner.imageKey || "";
-    document.getElementById("bannerImageUrl").value = c.banner.imageUrl || "";
 
     document.getElementById("basePrompt").value = c.prompts.base || "";
     document.getElementById("visionPrompt").value = c.prompts.vision || "";
@@ -2880,20 +2966,22 @@ a{color:#9dd1ff}
     document.getElementById("cMax").value = c.commission.maxPct;
 
     document.getElementById("featuresJson").value = JSON.stringify(c.features || {}, null, 2);
+    document.getElementById("cacheJson").value = JSON.stringify(c.cache || {}, null, 2);
     document.getElementById("securityJson").value = JSON.stringify(c.security || {}, null, 2);
 
     status.textContent="آماده";
-    setOut({ok:true, hint:"بارگذاری شد. فیلدهای ویژه فقط توسط ادمین اعمال می‌شوند."});
+    setOut({ok:true, hint:"بارگذاری شد. فیلدهای محدود به Owner برای سایر نقش‌ها نادیده گرفته می‌شود."});
   }
 
   async function saveCfg(){
     status.textContent="در حال ذخیره...";
-    let perStyle={}, stylesJson={}, newsJson={}, featuresJson={}, securityJson={};
-    try{ perStyle = JSON.parse(document.getElementById("perStyle").value || "{}"); }catch(e){ setOut("JSON سبک‌ها معتبر نیست"); status.textContent="خطا"; return; }
-    try{ stylesJson = JSON.parse(document.getElementById("stylesJson").value || "{}"); }catch(e){ setOut("JSON استایل‌ها معتبر نیست"); status.textContent="خطا"; return; }
-    try{ newsJson = JSON.parse(document.getElementById("newsJson").value || "{}"); }catch(e){ setOut("JSON اخبار معتبر نیست"); status.textContent="خطا"; return; }
-    try{ featuresJson = JSON.parse(document.getElementById("featuresJson").value || "{}"); }catch(e){ setOut("JSON ویژگی‌ها معتبر نیست"); status.textContent="خطا"; return; }
-    try{ securityJson = JSON.parse(document.getElementById("securityJson").value || "{}"); }catch(e){ setOut("JSON امنیت معتبر نیست"); status.textContent="خطا"; return; }
+    let perStyle={}, stylesJson={}, newsJson={}, featuresJson={}, cacheJson={}, securityJson={};
+    try{ perStyle = JSON.parse(document.getElementById("perStyle").value || "{}"); }catch(e){ setOut("JSON پرامپت سبک‌ها نامعتبر است"); status.textContent="خطا"; return; }
+    try{ stylesJson = JSON.parse(document.getElementById("stylesJson").value || "{}"); }catch(e){ setOut("JSON سبک‌ها نامعتبر است"); status.textContent="خطا"; return; }
+    try{ newsJson = JSON.parse(document.getElementById("newsJson").value || "{}"); }catch(e){ setOut("JSON اخبار نامعتبر است"); status.textContent="خطا"; return; }
+    try{ featuresJson = JSON.parse(document.getElementById("featuresJson").value || "{}"); }catch(e){ setOut("JSON ویژگی‌ها نامعتبر است"); status.textContent="خطا"; return; }
+    try{ cacheJson = JSON.parse(document.getElementById("cacheJson").value || "{}"); }catch(e){ setOut("JSON کش نامعتبر است"); status.textContent="خطا"; return; }
+    try{ securityJson = JSON.parse(document.getElementById("securityJson").value || "{}"); }catch(e){ setOut("JSON امنیت نامعتبر است"); status.textContent="خطا"; return; }
 
     const patch = {
       walletPublic: document.getElementById("walletPublic").value.trim(),
@@ -2910,8 +2998,7 @@ a{color:#9dd1ff}
         enabled: document.getElementById("bannerEnabled").value === "true",
         text: document.getElementById("bannerText").value,
         link: document.getElementById("bannerLink").value,
-        imageKey: document.getElementById("bannerImageKey").value,
-        imageUrl: document.getElementById("bannerImageUrl").value
+        imageKey: document.getElementById("bannerImageKey").value.trim()
       },
       prompts: {
         base: document.getElementById("basePrompt").value,
@@ -2930,6 +3017,7 @@ a{color:#9dd1ff}
         maxPct: Number(document.getElementById("cMax").value)
       },
       features: featuresJson,
+      cache: cacheJson,
       security: securityJson
     };
 
@@ -2977,15 +3065,15 @@ a{color:#9dd1ff}
   }
 
   async function broadcast(){
-    const msg = prompt("پیام همگانی (فقط ادمین):");
+    const msg = prompt("متن پیام همگانی:");
     if(!msg) return;
     const r = await api("/api/admin/broadcast/start", {text: msg});
     setOut(r);
   }
 
   document.getElementById("login").onclick = () => {
-    const t = prompt("توکن ADMIN_BEARER_TOKEN را وارد کنید (اختیاری):");
-    if(t){ localStorage.setItem("admin_bearer", t.trim()); alert("ذخیره شد. صفحه را رفرش کنید."); location.reload(); }
+    const t = prompt("توکن ADMIN_BEARER_TOKEN را وارد کن:");
+    if(t){ localStorage.setItem("admin_bearer", t.trim()); alert("ذخیره شد. صفحه را رفرش کن."); location.reload(); }
   };
 
   document.getElementById("loadCfg").onclick = loadCfg;
@@ -3005,6 +3093,24 @@ a{color:#9dd1ff}
 </script>
 </body>
 </html>`;
+}
+
+async function handleBannerAsset(request, env, cfg) {
+  if (!env.BOT_R2) return new Response("no_r2", { status: 404 });
+  const url = new URL(request.url);
+  const key = url.searchParams.get("key") || cfg.banner?.imageKey || "";
+  if (!key) return new Response("no_key", { status: 404 });
+  try {
+    const obj = await env.BOT_R2.get(key);
+    if (!obj) return new Response("not_found", { status: 404 });
+    const headers = new Headers();
+    headers.set("cache-control", "public, max-age=3600");
+    headers.set("content-type", obj.httpMetadata?.contentType || "image/png");
+    return new Response(obj.body, { status: 200, headers });
+  } catch (e) {
+    console.error("R2 banner error", e);
+    return new Response("error", { status: 500 });
+  }
 }
 
 // ========== Responses ==========
@@ -3136,16 +3242,14 @@ async function handleMiniAppApi(request, env, cfg) {
       let newsBundle = null;
       if (user.settings.news && cfg.features.newsEnabled) newsBundle = await getNewsBundle(env, cfg, market, symbol);
 
-      const prompt = buildAnalysisPrompt(cfg, user, market, symbol, user.settings.tf, snap, newsBundle);
-      const ai = await analyzeWithCache(env, cfg, prompt);
-
+      const analysis = await analyzeWithCache(env, cfg, user, market, symbol, user.settings.tf, snap, newsBundle);
       let analysisText = "";
       let zones = [];
-      if (ai.ok) {
-        analysisText = String(ai.text || "");
-        zones = ai.zones || [];
+      if (analysis.ok) {
+        analysisText = String(analysis.text || "");
+        zones = analysis.zones || [];
       } else {
-        analysisText = "AI در دسترس نیست یا خطا داد: " + (ai.error || "unknown");
+        analysisText = "AI در دسترس نیست یا خطا داد: " + (analysis.error || "unknown");
       }
 
       const chartUrl = cfg.features.chartEnabled ? buildChartUrl(cfg, symbol, user.settings.tf, candles, zones) : "";
@@ -3173,7 +3277,7 @@ async function handleMiniAppApi(request, env, cfg) {
     if (request.method === "GET") return jsonResponse({ ok: true, wallet: user.wallet });
     const body = await request.json().catch(() => ({}));
     const addr = String(body.bep20 || "").trim();
-    if (addr && !isValidBep20Address(addr)) return jsonResponse({ ok: false, error: "invalid_wallet" }, 400);
+    if (addr && !isValidEvmAddress(addr)) return jsonResponse({ ok: false, error: "invalid_wallet" }, 400);
     user.wallet.bep20 = addr;
     await saveUser(env, user);
     return jsonResponse({ ok: true, wallet: user.wallet });
@@ -3196,7 +3300,7 @@ async function handleMiniAppApi(request, env, cfg) {
 
 // ========== Admin APIs ==========
 function maskUserForAdmin(role, u) {
-  const owner = role === "admin" || role === "owner";
+  const owner = role === "owner" || role === "admin";
   return {
     id: u.id,
     createdAt: u.createdAt,
@@ -3254,7 +3358,7 @@ async function handleAdminApi(request, env, cfg) {
       await notifyOwners(env, `🚨 هشدار: تغییر ولت عمومی توسط ${uid}\nWallet: ${String(patch.walletPublic).trim()}`);
       await notifyStaff(env, `ℹ️ ولت عمومی تغییر کرد.\nBy: ${uid}\nWallet: ${String(patch.walletPublic).trim()}`);
     }
-    return jsonResponse({ ok: true, cfg: saved, note: role === "admin" ? "برخی فیلدها فقط برای ادمین اعمال می‌شود." : "ذخیره شد." });
+    return jsonResponse({ ok: true, cfg: saved, note: "ذخیره شد." });
   }
 
   if (path === "/api/admin/config/rollback" && request.method === "POST") {
@@ -3275,8 +3379,8 @@ async function handleAdminApi(request, env, cfg) {
     const limit = clamp(safeParseInt(url.searchParams.get("limit"), 50), 1, 200);
     const cursor = url.searchParams.get("cursor") || "";
     const full = url.searchParams.get("full") === "1";
-    const isSuper = role === "admin" || role === "owner";
-    if (full && !isSuper) return jsonResponse({ ok: false, error: "admin_only_full" }, 403);
+    const isPrivileged = role === "owner" || role === "admin";
+    if (full && !isPrivileged) return jsonResponse({ ok: false, error: "owner_only_full" }, 403);
 
     const r = await kvList(env, `${KV_PREFIX}user:`, limit, cursor || undefined);
     const users = [];
@@ -3296,7 +3400,7 @@ async function handleAdminApi(request, env, cfg) {
   }
 
   if (path === "/api/admin/users/ban" && request.method === "POST") {
-    if (!(role === "admin" || role === "owner")) return jsonResponse({ ok: false, error: "admin_only" }, 403);
+    if (!(role === "owner" || role === "admin")) return jsonResponse({ ok: false, error: "owner_only" }, 403);
     const body = await request.json().catch(() => ({}));
     const id = String(body.id || "").trim();
     const hours = clamp(safeParseInt(body.hours, 24), 1, 24 * 365);
@@ -3313,7 +3417,7 @@ async function handleAdminApi(request, env, cfg) {
   }
 
   if (path === "/api/admin/users/unban" && request.method === "POST") {
-    if (!(role === "admin" || role === "owner")) return jsonResponse({ ok: false, error: "admin_only" }, 403);
+    if (!(role === "owner" || role === "admin")) return jsonResponse({ ok: false, error: "owner_only" }, 403);
     const body = await request.json().catch(() => ({}));
     const id = String(body.id || "").trim();
     const u = await kvGetJson(env, kUser(id));
@@ -3399,7 +3503,7 @@ async function handleAdminApi(request, env, cfg) {
   }
 
   if (path === "/api/admin/audit/list") {
-    if (!(role === "admin" || role === "owner")) return jsonResponse({ ok: false, error: "admin_only" }, 403);
+    if (!(role === "owner" || role === "admin")) return jsonResponse({ ok: false, error: "owner_only" }, 403);
     const limit = clamp(safeParseInt(url.searchParams.get("limit"), 50), 1, 200);
     const cursor = url.searchParams.get("cursor") || "";
     const r = await kvList(env, `${KV_PREFIX}auditidx:`, limit, cursor || undefined);
@@ -3414,7 +3518,7 @@ async function handleAdminApi(request, env, cfg) {
   }
 
   if (path === "/api/admin/broadcast/start" && request.method === "POST") {
-    if (!(role === "admin" || role === "owner")) return jsonResponse({ ok: false, error: "admin_only" }, 403);
+    if (!(role === "owner" || role === "admin")) return jsonResponse({ ok: false, error: "owner_only" }, 403);
     if (!cfg.features.broadcastEnabled) return jsonResponse({ ok: false, error: "broadcast_disabled" }, 400);
 
     const body = await request.json().catch(() => ({}));
@@ -3834,16 +3938,14 @@ async function runSignalsAndSend(env, cfg, chatId, userId, user, market, symbol)
       await tgSendMessage(env, chatId, trunc(newsMsg, 3800), mainMenuKeyboard());
     }
 
-    const prompt = buildAnalysisPrompt(cfg, user, market, symbol, user.settings.tf, snap, newsBundle);
-    const ai = await analyzeWithCache(env, cfg, prompt);
-
+    const analysis = await analyzeWithCache(env, cfg, user, market, symbol, user.settings.tf, snap, newsBundle);
     let analysisText = "";
     let zones = [];
-    if (ai.ok) {
-      analysisText = String(ai.text || "");
-      zones = ai.zones || [];
+    if (analysis.ok) {
+      analysisText = String(analysis.text || "");
+      zones = analysis.zones || [];
     } else {
-      analysisText = "❌ AI در دسترس نیست یا خطا داد.\n" + (ai.error || "");
+      analysisText = "❌ AI در دسترس نیست یا خطا داد.\n" + (analysis.error || "");
       zones = [];
     }
 
@@ -3923,6 +4025,7 @@ async function handleLevelFlow(env, cfg, chatId, userId, user, text) {
   const allowed = availableStylesForUser(cfg, user);
   user.settings.style = allowed.includes(s.style) ? s.style : user.settings.style;
   user.settings.news = !!s.news;
+  user.profile.level = r.result.level;
 
   await saveUser(env, user);
 
@@ -3932,7 +4035,7 @@ async function handleLevelFlow(env, cfg, chatId, userId, user, text) {
     `خلاصه: ${r.result.summary_fa}\n\n` +
     `پیشنهاد بازار: ${r.result.recommended_market}\n` +
     `تنظیمات پیشنهادی اعمال شد ✅\n` +
-    `TF=${user.settings.tf} | ریسک=${user.settings.risk} | سبک=${styleLabel(cfg, user.settings.style)} | اخبار=${user.settings.news ? "روشن" : "خاموش"}\n\n` +
+    `TF=${user.settings.tf} | Risk=${user.settings.risk} | Style=${styleLabel(cfg, user.settings.style)} | اخبار=${user.settings.news ? "روشن" : "خاموش"}\n\n` +
     `اگر نیاز به «تعیین سطح مجدد» یا «تغییر تنظیمات» داری، از دکمه‌های زیر استفاده کن.\n`;
 
   await tgSendMessage(env, chatId, msg, mainMenuKeyboard(), { reply_markup: levelResultInline() });
@@ -4000,31 +4103,27 @@ async function handleMessage(env, cfg, chatId, userId, user, text, msg) {
     await handleLevelFlow(env, cfg, chatId, userId, user, t);
     return;
   }
-  if (user.state.flow === "ticket_preset") {
+  if (user.state.flow === "support_menu") {
     if (t === "/menu" || t === "⬅️ منو") {
       user.state.flow = "idle";
       await saveUser(env, user);
       await tgSendMessage(env, chatId, "منوی اصلی:", mainMenuKeyboard());
       return;
     }
-    if (t === "✍️ متن دلخواه") {
-      user.state.flow = "ticket_write";
-      await saveUser(env, user);
-      await tgSendMessage(env, chatId, "پیامت را بنویس:", backToMenuKeyboard());
-      return;
-    }
-    if (SUPPORT_PRESET_QUESTIONS.includes(t)) {
-      user.state.flow = "idle";
-      await saveUser(env, user);
-      const ticket = await createTicket(env, userId, t);
-      await tgSendMessage(env, chatId, "✅ تیکت شما ثبت شد. پشتیبانی پاسخ می‌دهد.", mainMenuKeyboard());
-      await notifyStaff(env, `🆘 تیکت جدید\nTicket: ${ticket.id}\nUser: ${userId}\nText: ${trunc(t, 700)}`);
-      return;
-    }
-    await tgSendMessage(env, chatId, "لطفاً یکی از گزینه‌ها را انتخاب کن یا «متن دلخواه» را بزن.", supportPresetKeyboard());
+    user.state.flow = "idle";
+    await saveUser(env, user);
+    const ticket = await createTicket(env, userId, t);
+    await tgSendMessage(env, chatId, "✅ پیام شما ثبت شد. پشتیبانی پاسخ می‌دهد.", mainMenuKeyboard());
+    await notifyStaff(env, `🆘 تیکت جدید\nTicket: ${ticket.id}\nUser: ${userId}\nText: ${trunc(t, 700)}`);
     return;
   }
   if (user.state.flow === "ticket_write") {
+    if (t === "/menu" || t === "⬅️ منو") {
+      user.state.flow = "idle";
+      await saveUser(env, user);
+      await tgSendMessage(env, chatId, "منوی اصلی:", mainMenuKeyboard());
+      return;
+    }
     user.state.flow = "idle";
     await saveUser(env, user);
     const ticket = await createTicket(env, userId, t);
@@ -4118,8 +4217,9 @@ async function handleMessage(env, cfg, chatId, userId, user, text, msg) {
       `شماره: ${user.profile.phone || "-"}\n` +
       `سطح: ${user.profile.level || "-"}\n` +
       `تجربه: ${user.profile.experience || "-"}\n` +
+      `سطح: ${user.profile.level || "-"}\n` +
       `بازار علاقه‌مند: ${user.profile.favoriteMarket || "-"}\n\n` +
-      `🎛 تنظیمات: TF=${user.settings.tf} | ریسک=${user.settings.risk} | سبک=${styleLabel(cfg, user.settings.style)} | اخبار=${user.settings.news ? "روشن" : "خاموش"}\n\n` +
+      `🎛 تنظیمات: TF=${user.settings.tf} | Risk=${user.settings.risk} | Style=${styleLabel(cfg, user.settings.style)} | اخبار=${user.settings.news ? "روشن" : "خاموش"}\n\n` +
       `💳 اشتراک: ${isSub ? "فعال ✅" : "غیرفعال"} | تا: ${until}\n` +
       `⚡ سهمیه روزانه: ${quotaBar(view.dailyUsed, view.dailyLimit)}\n` +
       (view.monthlyLimit !== null ? `📅 سهمیه ماهانه: ${quotaBar(view.monthlyUsed, view.monthlyLimit)}\n` : "") +
@@ -4163,7 +4263,13 @@ async function handleMessage(env, cfg, chatId, userId, user, text, msg) {
       await tgSendMessage(env, chatId, r.error, mainMenuKeyboard());
       return;
     }
-    await tgSendMessage(env, chatId, "✅ TXID ثبت شد و در انتظار تایید است.", mainMenuKeyboard());
+    let verifyNote = "";
+    if (r.record?.verify?.checked) {
+      verifyNote = r.record.verify.match
+        ? "\n✅ بررسی هوشمند بلاکچین: پرداخت به ولت صحیح تشخیص داده شد."
+        : "\n⚠️ بررسی هوشمند بلاکچین: پرداخت به ولت تأیید نشد (نیاز به بررسی ادمین).";
+    }
+    await tgSendMessage(env, chatId, "✅ TXID ثبت شد و در انتظار تایید است." + verifyNote, mainMenuKeyboard());
     await notifyStaff(env, `💳 پرداخت جدید (pending)\nUser: ${userId}\nTXID: ${txid}`, {
       inline_keyboard: [[{ text: "✅ Approve", callback_data: `pay:approve:${txid}` }, { text: "❌ Reject", callback_data: `pay:reject:${txid}` }]]
     });
@@ -4214,7 +4320,10 @@ async function handleMessage(env, cfg, chatId, userId, user, text, msg) {
   if (t.startsWith("/setwallet")) {
     if (!isAdminId(env, userId)) return tgSendMessage(env, chatId, "⛔️ دسترسی ندارید.", mainMenuKeyboard());
     const addr = t.split(/\s+/)[1] || "";
-    if (addr && !isValidBep20Address(addr)) return tgSendMessage(env, chatId, "❌ آدرس ولت نامعتبر است.", mainMenuKeyboard());
+    if (addr && !isValidEvmAddress(addr)) {
+      await tgSendMessage(env, chatId, "❌ آدرس ولت نامعتبر است. فرمت باید 0x... باشد.", mainMenuKeyboard());
+      return;
+    }
     const old = (await publicWallet(env, cfg)) || "";
 
     // Admin-only recommended; we still ALARM owners.
@@ -4234,6 +4343,14 @@ async function handleMessage(env, cfg, chatId, userId, user, text, msg) {
     cfg.limits.freeDaily = Math.max(1, n);
     await saveConfig(env, userId, cfg, "setfreelimit");
     await tgSendMessage(env, chatId, `✅ free daily limit = ${cfg.limits.freeDaily}`, mainMenuKeyboard());
+    return;
+  }
+  if (t.startsWith("/setfreemonth")) {
+    if (!isAdminId(env, userId)) return tgSendMessage(env, chatId, "⛔️ دسترسی ندارید.", mainMenuKeyboard());
+    const n = safeParseInt(t.split(/\s+/)[1], cfg.limits.freeMonthly);
+    cfg.limits.freeMonthly = Math.max(cfg.limits.freeDaily, Math.max(1, n));
+    await saveConfig(env, userId, cfg, "setfreemonth");
+    await tgSendMessage(env, chatId, `✅ free monthly limit = ${cfg.limits.freeMonthly}`, mainMenuKeyboard());
     return;
   }
 
@@ -4329,9 +4446,13 @@ async function handleMessage(env, cfg, chatId, userId, user, text, msg) {
   }
 
   if (t === "/support") {
-    user.state.flow = "ticket_preset";
+    user.state.flow = "support_menu";
     await saveUser(env, user);
-    await tgSendMessage(env, chatId, "🆘 لطفاً موضوع تیکت را انتخاب کن تا سریع‌تر رسیدگی شود:", supportPresetKeyboard());
+    const faqText =
+      "🆘 قبل از ارسال تیکت، یکی از سوالات پرتکرار زیر را ببین:\n\n" +
+      SUPPORT_FAQ.map((f, i) => `${i + 1}) ${f.q}`).join("\n") +
+      "\n\nاگر پاسخ را پیدا نکردی، روی «ارسال تیکت جدید» بزن.";
+    await tgSendMessage(env, chatId, faqText, mainMenuKeyboard(), { reply_markup: supportFaqInline() });
     return;
   }
 
@@ -4357,7 +4478,7 @@ async function handleMessage(env, cfg, chatId, userId, user, text, msg) {
 
   // Admin tools
   if (t === "/setwebhook") {
-    if (!isAdminId(env, userId)) return tgSendMessage(env, chatId, "⛔️ فقط ادمین.", mainMenuKeyboard());
+    if (!isAdminId(env, userId)) return tgSendMessage(env, chatId, "⛔️ فقط Admin/Owner.", mainMenuKeyboard());
     const wh = String(env.WEBHOOK_URL || "").trim();
     const secret = String(env.TELEGRAM_SECRET_TOKEN || "").trim();
     if (!wh) return tgSendMessage(env, chatId, "WEBHOOK_URL تنظیم نشده.", mainMenuKeyboard());
@@ -4366,14 +4487,14 @@ async function handleMessage(env, cfg, chatId, userId, user, text, msg) {
     return;
   }
   if (t === "/getwebhook") {
-    if (!isAdminId(env, userId)) return tgSendMessage(env, chatId, "⛔️ فقط ادمین.", mainMenuKeyboard());
+    if (!isAdminId(env, userId)) return tgSendMessage(env, chatId, "⛔️ فقط Admin/Owner.", mainMenuKeyboard());
     const r = await tgCall(env, "getWebhookInfo", {});
     await tgSendMessage(env, chatId, `getWebhookInfo:\n${JSON.stringify(r)}`, mainMenuKeyboard());
     return;
   }
 
   if (t.startsWith("/ban")) {
-    if (!isAdminId(env, userId)) return tgSendMessage(env, chatId, "⛔️ فقط ادمین.", mainMenuKeyboard());
+    if (!isAdminId(env, userId)) return tgSendMessage(env, chatId, "⛔️ فقط Admin/Owner.", mainMenuKeyboard());
     const parts = t.split(/\s+/);
     const target = parts[1] || "";
     const hours = clamp(safeParseInt(parts[2], 24), 1, 24 * 365);
@@ -4390,7 +4511,7 @@ async function handleMessage(env, cfg, chatId, userId, user, text, msg) {
     return;
   }
   if (t.startsWith("/unban")) {
-    if (!isAdminId(env, userId)) return tgSendMessage(env, chatId, "⛔️ فقط ادمین.", mainMenuKeyboard());
+    if (!isAdminId(env, userId)) return tgSendMessage(env, chatId, "⛔️ فقط Admin/Owner.", mainMenuKeyboard());
     const target = t.split(/\s+/)[1] || "";
     const u = await kvGetJson(env, kUser(target));
     if (!u) return tgSendMessage(env, chatId, "کاربر پیدا نشد.", mainMenuKeyboard());
@@ -4484,6 +4605,23 @@ async function handleCallback(env, cfg, cq) {
     await notifyStaff(env, `⚙️ درخواست تغییر تنظیمات\nUser: ${fromId}`);
     await tgSendMessage(env, chatId, "✅ درخواست شما برای ادمین ارسال شد.", mainMenuKeyboard());
     return;
+  }
+
+  if (data === "support:new") {
+    user.state.flow = "ticket_write";
+    await saveUser(env, user);
+    await tgAnswerCallback(env, id, "ارسال پیام پشتیبانی.", false);
+    await tgSendMessage(env, chatId, "✍️ پیام پشتیبانی را بنویس. (برای برگشت /menu)", backToMenuKeyboard());
+    return;
+  }
+  if (data.startsWith("support:faq:")) {
+    const fid = data.split(":")[2] || "";
+    const faq = SUPPORT_FAQ.find((f) => f.id === fid);
+    if (faq) {
+      await tgAnswerCallback(env, id, "پاسخ آماده شد.", false);
+      await tgSendMessage(env, chatId, `📌 ${faq.q}\n\n${faq.a}`, mainMenuKeyboard(), { reply_markup: supportFaqInline() });
+      return;
+    }
   }
 
   await tgAnswerCallback(env, id, "OK", false);
@@ -4632,6 +4770,12 @@ async function router(request, env, ctx) {
     return await handleTelegramWebhook(request, env, ctx);
   }
 
+  // Payment webhook (optional)
+  if (path === "/webhook/payment" && request.method === "POST") {
+    const cfg = await loadConfig(env);
+    return await handlePaymentWebhook(request, env, cfg);
+  }
+
   // Miniapp route must be ROOT
   if (path === "/" && request.method === "GET") {
     return htmlResponse(miniAppHtml());
@@ -4639,6 +4783,10 @@ async function router(request, env, ctx) {
   // Alias /miniapp -> /
   if (path === "/miniapp") {
     return new Response("", { status: 302, headers: { location: "/" } });
+  }
+  if (path === "/banner" && request.method === "GET") {
+    const cfg = await loadConfig(env);
+    return await handleBannerAsset(request, env, cfg);
   }
 
   // Admin panel
